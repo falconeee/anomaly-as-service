@@ -3,7 +3,7 @@
 #   artifacts -> /mlartifacts (--artifacts-destination; swap for s3://... in the cloud)
 # With --serve-artifacts the server proxies artifact uploads/downloads, so clients only need
 # MLFLOW_TRACKING_URI: no storage credentials on the API, worker or trainer.
-FROM python:3.12-slim-bookworm
+FROM python:3.14-slim-bookworm
 COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /bin/
 
 # Same MLflow version as uv.lock (clients and server should match).
