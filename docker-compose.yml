@@ -33,7 +33,7 @@ x-healthcheck: &healthcheck
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: mlflow
       POSTGRES_PASSWORD: mlflow
