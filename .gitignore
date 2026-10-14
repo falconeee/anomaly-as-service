@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- anomaly-as-service ---
+.DS_Store
+data/
+mlruns/
+mlartifacts/
+artifacts/
+*.pt
