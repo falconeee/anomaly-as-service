@@ -126,7 +126,7 @@ services:
     restart: "no"
 
   prometheus:
-    image: prom/prometheus:v3.13.4
+    image: prom/prometheus:v3.15.0
     profiles: ["monitoring"]
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
