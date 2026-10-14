@@ -1,17 +1,52 @@
-import pandas as pd
-import numpy as np
-import math
-import random
-import os
-import time
-import gc
+from __future__ import annotations
 
+import math
+import os
+import random
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, Dataset, ConcatDataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
+
 from anomaly_service.logger import logger
+
+# Called once per training epoch as callback(epoch, metrics), with epoch starting at 1.
+EpochCallback = Callable[[int, dict[str, float]], None]
+
+
+class FeatureSchemaError(ValueError):
+    """The input frame does not carry the features the model was trained on."""
+
+    def __init__(self, missing: list, extra: list):
+        self.missing = list(missing)
+        self.extra = list(extra)
+        super().__init__(f"Input is missing features the model was trained on: {self.missing}")
+
+
+@dataclass
+class WindowScores:
+    """
+    Everything one inference pass produces, per generated window (see MSCVAE.score_windows).
+
+    W = number of windows, N = number of features. Window k ends at input row row_index[k].
+    The s_* matrices are each variable's reconstruction error expressed as POSITIVE excess
+    over its own normal baseline (robust z-score, clipped at 0), split by channel.
+    """
+
+    feature_names: list
+    row_index: np.ndarray  # (W,) input row each window ends at
+    phi: np.ndarray  # (W,) combined anomaly score, comparable to MSCVAE.threshold
+    s_diag: np.ndarray  # (W, N) matrix diagonal: the variable on its own
+    s_off: np.ndarray  # (W, N) matrix off-diagonal: the variable's relations to the others
+    s_val: np.ndarray  # (W, N) raw-value reconstruction
+    recon_z: np.ndarray  # (W, N) reconstructed values, still z-scored
 
 
 # Helper Classes
@@ -48,20 +83,42 @@ class AttributeMatrixGenerator:
         if isinstance(train_dataframes, pd.DataFrame):
             train_dataframes = [train_dataframes]
 
-        # Concat to calculate global statistics (mean, std)
-        # Z-score normalization is crucial so features with larger magnitudes do not dominate the dot product calculations.
+        # Concat to calculate global statistics (mean, std). Z-score normalization is crucial
+        # so features with larger magnitudes do not dominate the dot product calculations.
         full_train_df = pd.concat(train_dataframes, ignore_index=True)
         self.mean = full_train_df.mean()
         self.std = full_train_df.std() + 1e-6  # Added epsilon to prevent division by zero
         # Store the physical minimum observed per variable in the (normal) training data.
         self.min_physical_vals = full_train_df.min().to_dict()
 
+    @property
+    def feature_names(self) -> list:
+        if self.mean is None:
+            raise ValueError("Execute .fit_scaler() first!")
+        return list(self.mean.index)
+
+    def align_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Returns `df` with exactly the training features, in the training order.
+
+        Pandas aligns `df - mean` by column LABEL and may reorder the result, while `.values`
+        reads by POSITION. Without this step a frame whose columns are merely in a different
+        order would silently feed each variable into another variable's matrix row.
+        Missing features raise FeatureSchemaError; extra columns are dropped.
+        """
+        expected = self.feature_names
+        missing = [c for c in expected if c not in df.columns]
+        if missing:
+            known = set(expected)
+            raise FeatureSchemaError(missing=missing, extra=[c for c in df.columns if c not in known])
+        return df[expected]
+
     def generate(self, df):
         if self.mean is None:
             raise ValueError("Execute .fit_scaler() first!")
 
-        # Scaling data to mean=0, std=1
-        data = (df - self.mean) / self.std
+        # Scaling data to mean=0, std=1 (columns first put in the training order)
+        data = (self.align_columns(df) - self.mean) / self.std
         # NaNs become 0 (which is the mean after scaling), preserving matrix stability
         values = np.nan_to_num(data.values)
 
@@ -203,14 +260,14 @@ class MSCVAE_Hybrid(nn.Module):
     """
 
     def __init__(self, n_features, n_scales=1, latent_dim=None):
-        super(MSCVAE_Hybrid, self).__init__()
+        super().__init__()
         self.n_features = n_features
         # Number of multi-scale attribute matrices stacked as input/output channels.
         self.n_scales = n_scales
-        if latent_dim is not None:
-            latent_dim = latent_dim
-        else:
+        if latent_dim is None:
             latent_dim = max(16, n_features // 2)
+        # Effective latent size, kept so a saved model can rebuild the exact same network.
+        self.latent_dim = latent_dim
 
         # Encoder: Extracts hierarchical spatial features from the (multi-scale) matrices
         self.enc1 = nn.Conv2d(n_scales, 16, 3, 2, 1)
@@ -264,7 +321,8 @@ class MSCVAE_Hybrid(nn.Module):
         """
         Reparameterization Trick: Allows backpropagation through the stochastic sampling process.
         During training, it adds Gaussian noise (std) to the mean (mu).
-        During evaluation (eval), it acts deterministically returning only the mean, stabilizing anomaly scores.
+        During evaluation (eval), it acts deterministically returning only the mean,
+        stabilizing anomaly scores.
         """
         if self.training:
             std = torch.exp(0.5 * logvar)
@@ -429,13 +487,14 @@ class SPOT:
         self.n = n_init
 
         # Fits the Generalized Pareto Distribution to the peaks
-        g, s, l = self._grimshaw()
+        g, s, _ = self._grimshaw()
         # Calculates the final strict threshold based on the desired false alarm probability (q)
         self.extreme_quantile = self._quantile(g, s)
 
         if verbose:
-            logger.info("Extreme quantile (probability = %s): %s" % (self.proba, self.extreme_quantile))
+            logger.info("Extreme quantile (probability = %s): %s", self.proba, self.extreme_quantile)
 
+    @staticmethod
     def _rootsFinder(fun, jac, bounds, npoints, method):
         """Helper function for Grimshaw's trick: Finds roots of the derivative equation."""
         from scipy.optimize import minimize
@@ -446,7 +505,7 @@ class SPOT:
                 bounds, step = (0, 1e-4), 1e-5
             X0 = np.arange(bounds[0] + step, bounds[1], step)
         elif method == "random":
-            X0 = np.random.uniform(bounds[0], bounds[1], npoints)
+            X0 = np.random.default_rng().uniform(bounds[0], bounds[1], npoints)
 
         def objFun(X, f, jac):
             g = 0
@@ -462,19 +521,18 @@ class SPOT:
         opt = minimize(
             lambda X: objFun(X, fun, jac), X0, method="L-BFGS-B", jac=True, bounds=[bounds] * len(X0)
         )
-        X = opt.x
-        np.round(X, decimals=5)
+        # Round before de-duplicating so roots that differ only by solver noise collapse.
+        X = np.round(opt.x, decimals=5)
         return np.unique(X)
 
+    @staticmethod
     def _log_likelihood(Y, gamma, sigma):
         """Calculates the log-likelihood of the GPD given shape (gamma) and scale (sigma) parameters."""
         n = Y.size
         if gamma != 0:
             tau = gamma / sigma
-            L = -n * math.log(sigma) - (1 + (1 / gamma)) * (np.log(1 + tau * Y)).sum()
-        else:
-            L = n * (1 + math.log(Y.mean()))
-        return L
+            return -n * math.log(sigma) - (1 + (1 / gamma)) * (np.log(1 + tau * Y)).sum()
+        return n * (1 + math.log(Y.mean()))
 
     def _grimshaw(self, epsilon=1e-8, n_points=10):
         """
@@ -530,6 +588,9 @@ class SPOT:
         ll_best = SPOT._log_likelihood(self.peaks, gamma_best, sigma_best)
 
         for z in zeros:
+            if z == 0:
+                # z = 0 is the exponential case (gamma = 0), already the baseline above.
+                continue
             gamma = u(1 + z * self.peaks) - 1
             sigma = gamma / z
             ll = SPOT._log_likelihood(self.peaks, gamma, sigma)
@@ -559,9 +620,7 @@ class SPOT:
         Returns a dictionary containing the dynamic thresholds and the indices of anomalies.
         """
         if self.n > self.init_data.size:
-            logger.info(
-                "Warning : the algorithm seems to have already been run, you should initialize before running again"
-            )
+            logger.warning("SPOT seems to have already been run; call initialize() before running again")
             return {}
 
         th = []
@@ -584,14 +643,14 @@ class SPOT:
                         self.peaks = np.append(self.peaks, self.data[i] - self.init_threshold)
                         self.Nt += 1
                         self.n += 1
-                        g, s, l = self._grimshaw()
+                        g, s, _ = self._grimshaw()
                         self.extreme_quantile = self._quantile(g, s)
                 elif self.data[i] > self.init_threshold:
                     # Data point is a peak but NOT an anomaly: Update the GPD to learn the new normal.
                     self.peaks = np.append(self.peaks, self.data[i] - self.init_threshold)
                     self.Nt += 1
                     self.n += 1
-                    g, s, l = self._grimshaw()
+                    g, s, _ = self._grimshaw()
                     self.extreme_quantile = self._quantile(g, s)
                 else:
                     # Normal data point below initial threshold.
@@ -657,7 +716,7 @@ class MSCVAE:
             else:
                 self.device = torch.device("cpu")
         else:
-            self.device = device
+            self.device = torch.device(device)
 
         self.model = None
         # Instantiates the generator that will transform flat series into spatial-temporal inputs
@@ -688,7 +747,8 @@ class MSCVAE:
         """
         random.seed(seed)
         os.environ["PYTHONHASHSEED"] = str(seed)
-        np.random.seed(seed)
+        # Seeding the legacy GLOBAL NumPy RNG is intentional: third-party code may draw from it.
+        np.random.seed(seed)  # noqa: NPY002
         torch.manual_seed(seed)
 
         if torch.cuda.is_available():
@@ -712,11 +772,37 @@ class MSCVAE:
         ds = SequenceMatrixDataset(matrices, values, self.seq_len)
         return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
 
-    def fit(self, train_data, epochs=50, batch_size=128, lr=1e-3, gain=1.0, verbose=True):
+    def fit(
+        self,
+        train_data,
+        epochs=50,
+        batch_size=128,
+        lr=1e-3,
+        gain=1.0,
+        verbose=True,
+        callback: EpochCallback | None = None,
+        calibration_fraction: float = 0.0,
+    ):
         """
         Main training orchestration pipeline.
         Handles data preprocessing, model weight optimization, and statistical threshold calibration.
+
+        `callback(epoch, metrics)` is invoked after every epoch (epoch starts at 1) with
+        {"loss", "beta", "epoch_time_s"}. It lets callers (e.g. MLflow tracking) observe
+        training without coupling the model to any tracking library.
+
+        `calibration_fraction` holds out the LAST fraction of each training period from the
+        gradient updates and calibrates the SPOT threshold and the RCA baselines on it.
+        Errors on data the network was fitted on are optimistically small, so a threshold
+        calibrated on them is too tight and fires on any unseen normal data; held-out
+        normal data gives an honest error distribution. 0 keeps the original behavior
+        (calibrate on the training windows themselves).
         """
+        if not 0.0 <= calibration_fraction < 1.0:
+            raise ValueError("calibration_fraction must be in [0, 1)")
+        # Re-seed here so a fit is reproducible regardless of what consumed the global RNGs
+        # between construction and training.
+        self.set_deterministic(self.seed)
         self.gain = gain
         # Standardize input to a list of DataFrames to support training on multiple disjoint periods
         if isinstance(train_data, pd.DataFrame):
@@ -735,29 +821,32 @@ class MSCVAE:
         # Prepare data
         if verbose:
             logger.info("Generating training data...")
-        train_matrices = []
-        train_values = []
+        # (matrices, values, n_calibration_windows) per period
+        periods: list[tuple[torch.Tensor, torch.Tensor, int]] = []
         # One sequence dataset PER period, so temporal sequences never cross the
         # boundary between two disjoint training periods.
-        seq_datasets = []
+        seq_datasets: list[Dataset] = []
 
         for df in train_data:
             # Transforms flat multivariate series into spatial-temporal matrices and target values
             t_mat, t_val = self.generator.generate(df)
-            if t_mat.nelement() > 0:
-                train_matrices.append(t_mat)
-                train_values.append(t_val)
-                seq_datasets.append(SequenceMatrixDataset(t_mat, t_val, self.seq_len))
+            if t_mat.nelement() == 0:
+                continue
+            n_windows = t_mat.size(0)
+            n_cal = int(n_windows * calibration_fraction)
+            dataset = SequenceMatrixDataset(t_mat, t_val, self.seq_len)
+            # The held-out tail is never seen by the optimizer.
+            seq_datasets.append(Subset(dataset, range(n_windows - n_cal)) if n_cal else dataset)
+            periods.append((t_mat, t_val, n_cal))
 
-        if not seq_datasets:
+        if not periods:
             raise ValueError("No training data generated. Check window_size and data length!")
-
-        final_train_matrix = torch.cat(train_matrices, dim=0)
-        final_train_values = torch.cat(train_values, dim=0)
 
         # Shuffling batches is now safe: each item already carries its own temporal
         # context, so shuffling no longer feeds the transformer unrelated windows.
-        train_loader = DataLoader(ConcatDataset(seq_datasets), batch_size=batch_size, shuffle=True)
+        train_loader: DataLoader = DataLoader(
+            ConcatDataset(seq_datasets), batch_size=batch_size, shuffle=True
+        )
 
         # Initialize Model
         self.model = MSCVAE_Hybrid(
@@ -782,7 +871,7 @@ class MSCVAE:
             beta_val = calculate_beta_annealing(epoch, epochs)
 
             for batch_seq, batch_values in train_loader:
-                x_seq = batch_seq.to(self.device)  # (B, T, 1, N, N)
+                x_seq = batch_seq.to(self.device)  # (B, T, n_scales, N, N)
                 x_val = batch_values.to(self.device)
 
                 optimizer.zero_grad()
@@ -800,23 +889,43 @@ class MSCVAE:
                 optimizer.step()
                 total_loss += loss.item()
             epoch_duration = time.time() - epoch_start_time
+            # loss_function already averages over the batch, so the epoch loss is the mean
+            # over batches (dividing by the number of SAMPLES would shrink it by ~batch_size).
+            epoch_loss = total_loss / len(train_loader)
 
             if verbose and (epoch == 0 or epoch == epochs - 1 or (epoch + 1) % 5 == 0):
                 logger.info(
-                    f"Epoch {epoch + 1}/{epochs} | Loss: {total_loss / len(train_loader.dataset):.4f} | Time: {epoch_duration:.2f}s"
+                    f"Epoch {epoch + 1}/{epochs} | Loss: {epoch_loss:.4f} | Time: {epoch_duration:.2f}s"
+                )
+            if callback is not None:
+                callback(
+                    epoch + 1, {"loss": epoch_loss, "beta": float(beta_val), "epoch_time_s": epoch_duration}
                 )
 
         # Post-Training: Threshold Calibration (POT)
         if verbose:
             logger.info("Calculating threshold...")
-        # Evaluates the model on the normal training data to establish the baseline error
-        # distribution. Uses the COMBINED (matrix + value) score, so SPOT calibrates the
-        # threshold on exactly the quantity predict() will compare against.
-        train_scores = self._get_anomaly_scores(final_train_matrix, final_train_values)
+        # Evaluates the model on normal data (the held-out tail when calibration_fraction > 0)
+        # to establish the baseline error distribution. Each period is scored as a whole so
+        # held-out windows keep their temporal context. The score is the COMBINED (matrix +
+        # value) one, so SPOT calibrates on exactly the quantity predict() compares against.
+        p_mat, p_val = self._task_precisions()
+        diags, offs, vals = [], [], []
+        for t_mat, t_val, n_cal in periods:
+            mat_diag, mat_off, val_err = self._get_variable_errors(t_mat, t_val, batch_size=batch_size)
+            keep = slice(len(mat_diag) - n_cal, None) if n_cal else slice(None)
+            diags.append(mat_diag[keep])
+            offs.append(mat_off[keep])
+            vals.append(val_err[keep])
+        cal_diag, cal_off, cal_val = (np.concatenate(x, axis=0) for x in (diags, offs, vals))
+        calibration_scores = p_mat * (cal_diag.sum(axis=1) + cal_off.sum(axis=1) / 2.0)
+        calibration_scores = calibration_scores + p_val * cal_val.sum(axis=1)
+        if verbose:
+            logger.info(f"Calibrating on {len(calibration_scores)} windows")
 
         # Applies Extreme Value Theory (SPOT algorithm) to find the mathematical upper limit
         # of normal reconstruction errors, providing a strict, unsupervised alarm threshold.
-        self.threshold = self._pot_eval(train_scores)
+        self.threshold = self._pot_eval(calibration_scores)
 
         if verbose:
             logger.info(f"Base Threshold (POT): {self.threshold:.6f}")
@@ -829,7 +938,7 @@ class MSCVAE:
         # Calibrate the per-variable error baseline used by the contribution (RCA) routines.
         if verbose:
             logger.info("Calibrating per-variable error baseline...")
-        self._calibrate_variable_baseline(final_train_matrix, final_train_values)
+        self._set_variable_baseline(cal_diag, cal_off, cal_val)
 
     def _task_precisions(self):
         """
@@ -949,6 +1058,10 @@ class MSCVAE:
         variable and per channel.
         """
         mat_diag, mat_off, val_err = self._get_variable_errors(matrices, values, batch_size=batch_size)
+        self._set_variable_baseline(mat_diag, mat_off, val_err)
+
+    def _set_variable_baseline(self, mat_diag, mat_off, val_err):
+        """Median / scaled MAD per variable and channel from (W, N) error matrices."""
         k = 1.4826  # makes MAD comparable to a Gaussian standard deviation
 
         def _med_mad(a):
@@ -960,14 +1073,18 @@ class MSCVAE:
         self.mat_off_med_, self.mat_off_mad_ = _med_mad(mat_off)
         self.val_err_med_, self.val_err_mad_ = _med_mad(val_err)
 
-    def _pot_eval(self, init_score, q=1e-4, level=0.98):
+    def _pot_eval(self, init_score, q=1e-4, level=0.98, max_attempts=500):
         """
         Wrapper for the SPOT (Peaks-Over-Threshold) algorithm initialization.
         Finds the exact mathematical threshold (extreme_quantile) above which
         a reconstruction error is considered a true anomaly, rather than just noise.
+
+        If the GPD fit keeps failing (e.g. constant scores, or too few windows to have a
+        tail), it gives up after `max_attempts` and falls back to the empirical (1 - q)
+        quantile instead of looping forever.
         """
         lms = level
-        while True:
+        for _ in range(max_attempts):
             try:
                 s = SPOT(q)
                 s.fit(init_score, init_score)
@@ -975,12 +1092,22 @@ class MSCVAE:
                 # lacks distinct peaks, the Scipy optimization might fail (raise Exception).
                 s.initialize(level=lms, min_extrema=False, verbose=False)
             except Exception:
-                # Fallback mechanism: Gradually lowers the definition of what constitutes a 'peak'
-                # until the optimization algorithm converges successfully.
-                lms = lms * 0.999
+                pass
             else:
-                break
-        return s.extreme_quantile
+                if np.isfinite(s.extreme_quantile):
+                    return float(s.extreme_quantile)
+            # Fallback mechanism: Gradually lowers the definition of what constitutes a 'peak'
+            # until the optimization algorithm converges successfully.
+            lms = lms * 0.999
+
+        fallback = float(np.quantile(init_score, 1 - q))
+        logger.warning(
+            "SPOT did not converge after %d attempts; using the empirical %.6f quantile (%.6f)",
+            max_attempts,
+            1 - q,
+            fallback,
+        )
+        return fallback
 
     def predict(self, df_test, timestamps=None, batch_size=128):
         """
@@ -993,14 +1120,12 @@ class MSCVAE:
         self.model.eval()
 
         # Transform raw test data into correlation matrices (and the matching raw values).
-        try:
-            tensor_matrices, tensor_values = self.generator.generate(df_test)
-        except ValueError as e:
-            logger.info(f"Generation error: {e}")
-            return {}
+        # Schema problems (FeatureSchemaError) propagate: silently returning nothing would
+        # hide a broken input from the caller.
+        tensor_matrices, tensor_values = self.generator.generate(df_test)
 
         if tensor_matrices.nelement() == 0:
-            logger.info(f"Test dataframe too small for window {self.generator.w}.")
+            logger.info("Test dataframe is empty; nothing to score.")
             return {}
 
         # Combined anomaly score (matrix + value routes) for each window.
@@ -1011,14 +1136,10 @@ class MSCVAE:
         # This means the score calculated for matrix M_t actually represents the state
         # of the system at the *end* of that window. We must map the score back to the
         # correct original timestamp to avoid time-shift errors in production.
-        w = self.generator.w
         s = self.generator.step
 
         if timestamps is not None:
-            if hasattr(timestamps, "values"):
-                ts_values = timestamps.values
-            else:
-                ts_values = np.array(timestamps)
+            ts_values = timestamps.values if hasattr(timestamps, "values") else np.array(timestamps)
 
             # valid_indices map the generated sequences back to their original timestamps.
             # Since we padded the beginning, the first output corresponds to the first original element.
@@ -1043,9 +1164,124 @@ class MSCVAE:
             return {"timestamp": final_timestamps, "phi": final_scores}
         else:
             return {
-                "timestamp": np.arange(len(all_scores)),  # Dummy timestamps if none provided
+                # No timestamps given: report the input ROW each window ends at.
+                "timestamp": np.arange(len(all_scores)) * s,
                 "phi": all_scores,
             }
+
+    @property
+    def feature_names(self) -> list:
+        """Features the model was trained on, in training order."""
+        return self.generator.feature_names
+
+    @property
+    def warmup_rows(self) -> int:
+        """
+        Leading input rows whose windows are partly built from padding (the first value is
+        repeated to fill the history). Their scores are less reliable than the rest.
+        """
+        return self.generator.w - 1
+
+    def score_windows(self, df: pd.DataFrame, batch_size: int = 128) -> WindowScores:
+        """
+        Runs ONE inference pass over `df` and returns, for every generated window, the
+        combined anomaly score and the per-variable, per-channel standardized excess used by
+        root-cause analysis. Callers can then group windows into anomaly events and
+        aggregate the RCA per event without running the network again.
+        """
+        if self.model is None:
+            raise ValueError("Model not trained. Call .fit() first!")
+        if self.mat_diag_med_ is None:
+            raise ValueError("Per-variable baseline not calibrated. Re-run .fit().")
+
+        self.model.eval()
+        df = self.generator.align_columns(df)
+        tensor_matrices, tensor_values = self.generator.generate(df)
+        if tensor_matrices.nelement() == 0:
+            raise ValueError("No matrices generated from input dataframe!")
+
+        mat_diag, mat_off, val_err, recon_vals = self._get_variable_errors(
+            tensor_matrices, tensor_values, batch_size=batch_size, return_recon=True
+        )
+
+        # Per-window phi, IDENTICAL to the detector's COMBINED score (matrix + value, weighted
+        # by the learned precisions), so the windows selected here match those that tripped
+        # the threshold. Full matrix error = diag.sum + off.sum/2 (off counted from both ends).
+        p_mat, p_val = self._task_precisions()
+        mat_sumsq = mat_diag.sum(axis=1) + mat_off.sum(axis=1) / 2.0
+        val_sumsq = val_err.sum(axis=1)
+        phi = p_mat * mat_sumsq + p_val * val_sumsq
+
+        # Standardized positive excess over each variable's own normal baseline, per channel.
+        return WindowScores(
+            feature_names=self.feature_names,
+            row_index=np.arange(len(phi)) * self.generator.step,
+            phi=phi,
+            s_diag=np.clip((mat_diag - self.mat_diag_med_) / self.mat_diag_mad_, 0, None),
+            s_off=np.clip((mat_off - self.mat_off_med_) / self.mat_off_mad_, 0, None),
+            s_val=np.clip((val_err - self.val_err_med_) / self.val_err_mad_, 0, None),
+            recon_z=recon_vals,
+        )
+
+    def rca_window_scores(self, scores: WindowScores, combine_value: bool = True) -> np.ndarray:
+        """
+        Collapses the three channels of `scores` into one (W, N) attribution matrix.
+        Leans on the clean self-signal (diagonal) and treats the smeared relational error as
+        weaker corroborating evidence, so correlated-but-innocent variables are not blamed.
+        """
+        s = self.rca_self_weight * scores.s_diag + self.rca_rel_weight * scores.s_off
+        if combine_value:
+            s = s + scores.s_val
+        return s
+
+    def denormalize(self, values_z, variable_names=None, clip_physical: bool = True) -> np.ndarray:
+        """
+        Inverse z-score of (..., N) values back to the original units, optionally clipped to
+        the physical lower bound seen in training. Used for the "expected" (reconstructed)
+        value of a variable.
+        """
+        names = self.feature_names if variable_names is None else list(variable_names)
+        values = np.asarray(values_z, dtype=float) * self.generator.std.reindex(names).to_numpy()
+        values = values + self.generator.mean.reindex(names).to_numpy()
+        if clip_physical:
+            floors = np.array([self.generator.min_physical_vals.get(col, -np.inf) for col in names])
+            values = np.maximum(values, floors)
+        return values
+
+    @staticmethod
+    def select_contributors(contrib, peak_z, z_thresh: float = 3.0, top_k: int | None = None) -> np.ndarray:
+        """
+        Indices of the root-cause variables, strongest first.
+
+        - top_k is None -> statistical selection: keep a variable only if (A) its peak
+          standardized excess exceeds `z_thresh` (it deviates from its OWN normal) AND (B) its
+          aggregated contribution is a robust outlier among all variables (MAD rule). If the
+          anomaly is too subtle for the combined cut, fall back to the top-3.
+        - top_k is an int -> the `top_k` largest contributions, no statistical filtering.
+        """
+        contrib = np.asarray(contrib, dtype=float)
+        order = np.argsort(-contrib, kind="stable")
+        if top_k is not None:
+            return order[: int(top_k)]
+        cond_self = np.asarray(peak_z) > z_thresh
+        c_med = np.median(contrib)
+        c_mad = np.median(np.abs(contrib - c_med)) * 1.4826 + 1e-9
+        cond_peer = contrib > (c_med + z_thresh * c_mad)
+        selected = (cond_self & cond_peer)[order]
+        return order[selected] if selected.any() else order[:3]
+
+    def save(self, path: str | Path) -> Path:
+        """Saves the fitted model as a directory bundle (see model/persistence.py)."""
+        from anomaly_service.model.persistence import save_model
+
+        return save_model(self, path)
+
+    @classmethod
+    def load(cls, path: str | Path, device: str = "cpu") -> MSCVAE:
+        """Loads a model saved with .save()."""
+        from anomaly_service.model.persistence import load_model
+
+        return load_model(path, device=device)
 
     def _select_anomaly_windows(self, phi, anomaly_windows=None):
         """
@@ -1073,19 +1309,11 @@ class MSCVAE:
         its original timestamp. Optionally clips to the physical lower bound observed in
         the normal training data (never to NaN/missing variables).
         """
-        recon_arr = np.asarray(recon_arr, dtype=float).copy()
-        means = self.generator.mean.reindex(variable_names).values
-        stds = self.generator.std.reindex(variable_names).values
-        recon_arr = (recon_arr * stds) + means
-
-        if clip_physical:
-            floors = np.array([self.generator.min_physical_vals.get(col, -np.inf) for col in variable_names])
-            recon_arr = np.maximum(recon_arr, floors)
+        recon_arr = self.denormalize(recon_arr, variable_names, clip_physical=clip_physical)
 
         reconstruction_df = pd.DataFrame(recon_arr, columns=list(variable_names))
 
         if timestamps is not None:
-            w = self.generator.w
             s = self.generator.step
             ts_values = timestamps.values if hasattr(timestamps, "values") else np.array(timestamps)
 
@@ -1129,68 +1357,27 @@ class MSCVAE:
         Returns a dict with: variable_names, contrib (Σ excess over anomalous windows),
         peak_z (max standardized excess over those windows), phi, anom_mask, recon_vals.
         """
-        if self.model is None:
-            raise ValueError("Model not trained. Call .fit() first!")
-        if self.mat_diag_med_ is None:
-            raise ValueError("Per-variable baseline not calibrated. Re-run .fit().")
+        scores = self.score_windows(df_test, batch_size=batch_size)
+        s = self.rca_window_scores(scores, combine_value=combine_value)
 
-        self.model.eval()
-
-        # Keep only the columns the model was trained on, in the trained order.
-        df_test = df_test[self.generator.mean.index]
-
-        try:
-            tensor_matrices, tensor_values = self.generator.generate(df_test)
-        except ValueError as e:
-            raise ValueError(f"Generation error: {e}")
-        if tensor_matrices.nelement() == 0:
-            raise ValueError("No matrices generated from input dataframe!")
-
-        mat_diag, mat_off, val_err, recon_vals = self._get_variable_errors(
-            tensor_matrices, tensor_values, batch_size=batch_size, return_recon=True
-        )
-
-        # Per-window phi, IDENTICAL to the detector's COMBINED score (matrix + value, weighted
-        # by the learned precisions), so the windows selected here match those that tripped
-        # the threshold. Full matrix error = diag.sum + off.sum/2 (off counted from both ends).
-        p_mat, p_val = self._task_precisions()
-        mat_sumsq = mat_diag.sum(axis=1) + mat_off.sum(axis=1) / 2.0
-        val_sumsq = val_err.sum(axis=1)
-        phi = p_mat * mat_sumsq + p_val * val_sumsq
-
-        # Standardized positive excess over each variable's own normal baseline, per channel.
-        s_diag = np.clip((mat_diag - self.mat_diag_med_) / self.mat_diag_mad_, 0, None)
-        s_off = np.clip((mat_off - self.mat_off_med_) / self.mat_off_mad_, 0, None)
-        # Lean on the clean self-signal (diagonal); treat the smeared relational error as
-        # weaker corroborating evidence so correlated-but-innocent variables are not blamed.
-        s_mat = self.rca_self_weight * s_diag + self.rca_rel_weight * s_off
-        if combine_value:
-            s_val = np.clip((val_err - self.val_err_med_) / self.val_err_mad_, 0, None)
-            s = s_mat + s_val
-        else:
-            s = s_mat
-
-        anom_mask = self._select_anomaly_windows(phi, anomaly_windows)
+        anom_mask = self._select_anomaly_windows(scores.phi, anomaly_windows)
 
         contrib = s[anom_mask].sum(axis=0)  # total standardized excess during the anomaly
         peak_z = s[anom_mask].max(axis=0)  # strongest single-window deviation
-
-        del tensor_matrices, tensor_values, mat_diag, mat_off, val_err
-        gc.collect()
 
         return {
             "variable_names": self.generator.mean.index,
             "contrib": contrib,
             "peak_z": peak_z,
-            "phi": phi,
+            "phi": scores.phi,
             "anom_mask": anom_mask,
-            "recon_vals": recon_vals,
+            "recon_vals": scores.recon_z,
         }
 
     def contribution(
         self,
         df_test,
-        df_sistema,
+        df_sistema=None,
         timestamps=None,
         batch_size=128,
         anomaly_windows=None,
@@ -1220,6 +1407,9 @@ class MSCVAE:
             during the anomaly (no statistical filtering), and the reconstruction DataFrame
             is filtered down to exactly those variables (dashboard usage).
 
+        `df_sistema` (columns VARIAVEL, DESC, SISTEMA) is optional variable metadata; without
+        it DESC/SISTEMA are filled with 'NoDesc'/'NoSystem'.
+
         Returns (contributions_dict, reconstruction_df) in both modes.
         """
         res = self._variable_contribution_scores(
@@ -1228,7 +1418,6 @@ class MSCVAE:
         variable_names = res["variable_names"]
         contrib = res["contrib"]
         peak_z = res["peak_z"]
-        n_features = len(variable_names)
 
         df_contrib = pd.DataFrame(
             {
@@ -1237,31 +1426,18 @@ class MSCVAE:
                 "peak_z": peak_z,
             }
         )
-        df_contrib = pd.merge(
-            df_contrib, df_sistema[["VARIAVEL", "DESC", "SISTEMA"]], on="VARIAVEL", how="left"
-        )
-        df_contrib["DESC"] = df_contrib["DESC"].fillna("NoDesc")
-        df_contrib["SISTEMA"] = df_contrib["SISTEMA"].fillna("NoSystem")
-
-        if top_k is None:
-            # --- Statistical mode: (A) self-deviation AND (B) peer-standout ---
-            cond_self = peak_z > z_thresh
-            k = 1.4826
-            c_med = np.median(contrib)
-            c_mad = np.median(np.abs(contrib - c_med)) * k + 1e-9
-            cond_peer = contrib > (c_med + z_thresh * c_mad)
-            is_contrib = cond_self & cond_peer
-            if not is_contrib.any():
-                # Anomaly too subtle for the combined cut: fall back to the top-3.
-                top = np.argsort(contrib)[::-1][:3]
-                is_contrib = np.zeros(n_features, dtype=bool)
-                is_contrib[top] = True
-            df_contrib = df_contrib[is_contrib].copy()
-            df_contrib = df_contrib.sort_values(by="score", ascending=False).reset_index(drop=True)
+        if df_sistema is not None:
+            df_contrib = pd.merge(
+                df_contrib, df_sistema[["VARIAVEL", "DESC", "SISTEMA"]], on="VARIAVEL", how="left"
+            )
+            df_contrib["DESC"] = df_contrib["DESC"].fillna("NoDesc")
+            df_contrib["SISTEMA"] = df_contrib["SISTEMA"].fillna("NoSystem")
         else:
-            # --- Top-K mode: fixed cut by ranked contribution ---
-            df_contrib = df_contrib.sort_values(by="score", ascending=False).reset_index(drop=True)
-            df_contrib = df_contrib.head(int(top_k)).copy()
+            df_contrib["DESC"] = "NoDesc"
+            df_contrib["SISTEMA"] = "NoSystem"
+
+        selected = self.select_contributors(contrib, peak_z, z_thresh=z_thresh, top_k=top_k)
+        df_contrib = df_contrib.iloc[selected].reset_index(drop=True)
 
         total = df_contrib["score"].sum()
         df_contrib["%"] = (df_contrib["score"] / total * 100) if total > 0 else 0.0

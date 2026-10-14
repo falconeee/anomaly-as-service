@@ -60,10 +60,6 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "NPY"]
 
-[tool.ruff.lint.per-file-ignores]
-# The research model keeps its original style for now; it gets cleaned up in Phase 1.
-"src/anomaly_service/model/mscvae.py" = ["E", "W", "B", "UP", "SIM", "NPY", "F401", "F841", "I001"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
@@ -71,10 +67,12 @@ addopts = "-ra"
 [tool.mypy]
 python_version = "3.12"
 ignore_missing_imports = true
-exclude = ["src/anomaly_service/model/mscvae.py"]
+plugins = ["pydantic.mypy"]
 
 [dependency-groups]
 dev = [
+    "fakeredis>=2.39.0",
+    "mlflow>=3.17",
     "mypy>=2.4.0",
     "pre-commit>=4.7.0",
     "pytest>=9.1.1",
@@ -83,5 +81,4 @@ dev = [
 ]
 train = [
     "matplotlib>=3.11.2",
-    "mlflow>=3.17",
 ]

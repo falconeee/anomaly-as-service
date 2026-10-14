@@ -1,0 +1,1 @@
+"""Asynchronous detection worker (Celery)."""

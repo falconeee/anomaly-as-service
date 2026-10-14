@@ -1,0 +1,158 @@
+# Full stack:   docker compose up -d --build --wait
+# Train model:  docker compose --profile train run --rm trainer train --config configs/train_synthetic.yaml --register --promote
+# Monitoring:   docker compose --profile monitoring up -d
+# UIs:          API http://localhost:8000/docs | MLflow http://localhost:5050 | Grafana http://localhost:3000
+name: anomaly-service
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+    args:
+      GIT_SHA: ${GIT_SHA:-dev}
+  image: ${APP_IMAGE:-anomaly-service:local}
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    REDIS_URL: redis://redis:6379/0
+    API_KEY: ${API_KEY:-change-me}
+    MODEL_NAME: ${MODEL_NAME:-mscvae-synthetic}
+    MODEL_REFRESH_INTERVAL_S: ${MODEL_REFRESH_INTERVAL_S:-15}
+    LOG_JSON: "true"
+    # PyTorch would otherwise start one thread per host core in every container.
+    OMP_NUM_THREADS: "2"
+  restart: unless-stopped
+
+x-healthcheck: &healthcheck
+  interval: 10s
+  timeout: 5s
+  retries: 12
+  start_period: 20s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: mlflow
+      POSTGRES_DB: mlflow
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "pg_isready -U mlflow -d mlflow"]
+    restart: unless-stopped
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow.Dockerfile
+    image: ${MLFLOW_IMAGE:-anomaly-service-mlflow:local}
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql+psycopg://mlflow:mlflow@postgres:5432/mlflow
+      # Host headers MLflow accepts: the compose service name (other containers), the
+      # healthcheck (localhost:5000) and the browser on the published host port.
+      MLFLOW_ALLOWED_HOSTS: mlflow:5000,localhost:5000,localhost:${MLFLOW_PORT:-5050},127.0.0.1:${MLFLOW_PORT:-5050}
+    volumes:
+      - mlflow-artifacts:/mlartifacts
+    ports:
+      # Not 5000 on the host: macOS uses it for the AirPlay Receiver.
+      - "${MLFLOW_PORT:-5050}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "redis-cli", "ping"]
+    restart: unless-stopped
+
+  api:
+    <<: *app
+    command: ["api"]
+    ports:
+      - "8000:8000"
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck
+      # Liveness, not readiness: the API must come up even before a model is promoted.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"]
+
+  worker:
+    <<: *app
+    command: ["worker"]
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/metrics')"]
+
+  # One-off training job (not started by `up`): profile "train".
+  trainer:
+    <<: *app
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        UV_GROUPS: "--group train"
+        GIT_SHA: ${GIT_SHA:-dev}
+    image: ${TRAINER_IMAGE:-anomaly-service-trainer:local}
+    profiles: ["train"]
+    command: ["train", "--config", "configs/train_synthetic.yaml", "--register", "--promote"]
+    volumes:
+      - smd-data:/app/data  # dataset download cache
+      - ./datasets:/app/datasets:ro  # your own CSV files (configs/train_csv_example.yaml)
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    restart: "no"
+
+  prometheus:
+    image: prom/prometheus:v3.13.4
+    profiles: ["monitoring"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.0.11
+    profiles: ["monitoring"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/anomaly-service.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  mlflow-artifacts:
+  redis-data:
+  smd-data:

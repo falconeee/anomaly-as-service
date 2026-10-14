@@ -220,9 +220,15 @@ __marimo__/
 .streamlit/secrets.toml
 
 # --- anomaly-as-service ---
+# Anchored with a leading slash so they only match at the repo root
+# (a bare `data/` would also hide the src/anomaly_service/data package).
 .DS_Store
-data/
-mlruns/
-mlartifacts/
-artifacts/
+/data/
+/mlruns/
+/mlartifacts/
+/artifacts/
+/mlflow.db
 *.pt
+/examples/request_smd.json
+/datasets/
+/request.json

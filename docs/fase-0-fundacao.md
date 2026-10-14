@@ -1,80 +1,109 @@
 # Fase 0: Fundação do projeto
 
-## O que construímos
+Esta etapa prepara o ambiente de desenvolvimento: um pacote Python instalável, dependências com
+versões travadas e ferramentas que verificam o código automaticamente. Tudo o que vem depois
+(treino, API, Docker, CI) depende dessa base para ser reproduzível em qualquer máquina.
 
-- Um projeto Python empacotado (`anomaly-service`) em **src-layout**, com o modelo movido para
-  `src/anomaly_service/model/mscvae.py`.
-- Ambiente gerenciado pelo **uv**: `.venv`, `pyproject.toml` e `uv.lock`.
-- Dependências separadas em runtime, `dev` (ferramentas) e `train` (só para treinar).
-- PyTorch **CPU-only no Linux** (imagens Docker menores) e o wheel padrão com MPS no macOS.
-- Qualidade automatizada: ruff (lint e formatação), mypy, pytest e pre-commit.
-- O import quebrado `from src.utils import logger` foi substituído por
-  `anomaly_service/logger.py`.
+## Arquivos principais
 
-## Conceitos
+| Arquivo | Função |
+|---|---|
+| `pyproject.toml` | Nome do pacote, dependências e configuração das ferramentas |
+| `uv.lock` | Versão exata e hash de cada pacote instalado (gerado automaticamente) |
+| `.python-version` | Versão do Python usada (3.12) |
+| `src/anomaly_service/` | Código do pacote (o modelo está em `model/mscvae.py`) |
+| `.pre-commit-config.yaml` | Verificações executadas antes de cada commit |
+| `Makefile` | Atalhos para os comandos mais comuns (`make help` lista todos) |
 
-### `uv venv`, `uv add`, `uv sync` e `uv run`
+## Gerenciamento do ambiente com uv
+
+O [uv](https://docs.astral.sh/uv/) cria o ambiente virtual, instala as dependências e executa
+comandos dentro dele. Os comandos usados no projeto:
 
 | Comando | O que faz |
 |---|---|
-| `uv venv --python 3.12` | Cria o `.venv` (baixa o Python se necessário) |
-| `uv add pacote` | Adiciona ao `pyproject.toml`, **resolve** e atualiza o `uv.lock`, depois instala |
-| `uv add --dev` / `--group train` | O mesmo, mas num grupo de dependências (PEP 735) |
-| `uv sync` | Deixa o `.venv` **idêntico** ao lock (instala o que falta, remove o que sobra) |
-| `uv sync --frozen` | Usa o lock como está, sem re-resolver. É o modo de CI e Docker |
-| `uv run cmd` | Roda o comando dentro do ambiente, sincronizando antes se preciso |
+| `uv venv --python 3.12` | Cria o ambiente virtual `.venv` (baixa o Python se necessário) |
+| `uv add pacote` | Adiciona uma dependência ao `pyproject.toml`, atualiza o `uv.lock` e instala |
+| `uv add --dev pacote` | O mesmo, no grupo de ferramentas de desenvolvimento |
+| `uv sync` | Deixa o `.venv` idêntico ao `uv.lock` (instala o que falta, remove o que sobra) |
+| `uv sync --frozen` | Instala exatamente o `uv.lock`, sem recalcular nada (modo usado no CI e no Docker) |
+| `uv run comando` | Executa um comando dentro do ambiente |
 
-### Por que existe um lockfile
+### Por que existe o `uv.lock`
 
-O `pyproject.toml` declara **intervalos** (`torch>=2.14.1`), e o `uv.lock` grava a **versão exata
-e o hash** de cada pacote, transitivos incluídos (141 aqui). Com ele, seu Mac, o CI e a imagem
-Docker instalam exatamente os mesmos bytes. O lock do uv é **universal**: um único arquivo serve
-macOS e Linux. O `environments` em `[tool.uv]` limita a resolução a esses dois sistemas.
+O `pyproject.toml` declara **faixas** de versão (por exemplo, `torch>=2.14.1`). O `uv.lock`
+registra a **versão exata e o hash** de cada pacote, inclusive das dependências indiretas. Com
+ele, a máquina de desenvolvimento, o CI e a imagem Docker instalam exatamente os mesmos arquivos.
+Um único `uv.lock` atende macOS e Linux.
 
-### Índice explícito do PyTorch
+### PyTorch sem CUDA no Linux
 
-No Linux, o `torch` do PyPI vem com CUDA, o que soma alguns GB de bibliotecas NVIDIA. O índice
-`download.pytorch.org/whl/cpu` publica builds só de CPU. Com `explicit = true`, esse índice
-**só** é consultado para pacotes que optam por ele (`[tool.uv.sources]`), o que evita que um
-índice de terceiros "sequestre" outras dependências (*dependency confusion*). Confira no lock:
-`torch 2.14.1+cpu` para Linux e `torch 2.14.1` para macOS.
+No Linux, o PyTorch publicado no PyPI inclui bibliotecas da NVIDIA para GPU, que somam vários GB.
+O projeto não usa GPU em produção, então o `pyproject.toml` aponta o PyTorch do Linux para o
+índice de pacotes *CPU-only* do próprio PyTorch. No macOS, continua o pacote padrão, que usa a GPU
+do Mac (MPS). O índice é declarado como `explicit = true`, ou seja, é consultado **apenas** para o
+PyTorch; isso impede que um índice de terceiros forneça outras dependências por engano.
+
+No `uv.lock`, isso aparece como `torch 2.14.1+cpu` para Linux e `torch 2.14.1` para macOS.
 
 ### Grupos de dependências
 
-- **runtime** (`[project.dependencies]`): o que a API e o worker precisam em produção. Usamos
-  `mlflow-skinny`, que basta para carregar modelos e falar com o servidor.
-- **dev**: pytest, ruff, mypy e pre-commit. Nunca vão para a imagem.
-- **train**: matplotlib e o `mlflow` completo (UI e servidor local).
+| Grupo | Conteúdo | Onde é instalado |
+|---|---|---|
+| principal | Tudo que a API e o worker precisam (torch, pandas, FastAPI, Celery, mlflow-skinny...) | Sempre |
+| `dev` | pytest, ruff, mypy, pre-commit, fakeredis, mlflow completo (interface web local) | Só na máquina de desenvolvimento |
+| `train` | matplotlib (gráficos do treino) | Desenvolvimento e imagem do trainer |
 
-`default-groups = ["dev", "train"]` faz o `uv sync` local instalar tudo. O Docker vai usar
-`--no-default-groups`.
+`uv sync` instala os três grupos. As imagens Docker instalam só o necessário.
 
-### src-layout
+## Organização do código (src-layout)
 
-Com o código em `src/anomaly_service/`, o pacote **não** é importável a partir da raiz do repo
-por acidente. Os testes passam a exercitar o pacote *instalado* (o `uv sync` o instala em modo
-editável), igual ao que acontece em produção. No layout plano, `import anomaly_service`
-funcionaria só porque você está na pasta certa.
+O código fica em `src/anomaly_service/`, e não na raiz do repositório. Assim, o pacote só pode ser
+importado depois de instalado (o `uv sync` faz isso). Os testes passam a usar o pacote instalado,
+como acontece em produção, em vez de funcionar por acaso por estarem na pasta certa.
 
-### Pre-commit com hooks locais
+## Verificações automáticas
 
-Os hooks do ruff rodam via `uv run`, então usam **a versão do lock**. Não há uma segunda versão
-de ruff no `.pre-commit-config.yaml` para ficar dessincronizada. O hook `uv lock --check` impede
-commitar um `pyproject.toml` alterado sem atualizar o lock.
+| Ferramenta | Verifica |
+|---|---|
+| ruff | Erros comuns, imports, estilo e formatação |
+| mypy | Tipos (por exemplo, passar texto onde se espera número) |
+| pytest | Testes automatizados |
+| pre-commit | Executa ruff, formatação e `uv lock --check` antes de cada commit |
 
-## Decisões
+Os hooks do pre-commit chamam as ferramentas via `uv run`, usando as mesmas versões do `uv.lock`.
+O hook `uv lock --check` impede commitar um `pyproject.toml` alterado sem atualizar o lock.
 
-- [ADR 0001: uv como gerenciador de pacotes e ambientes](adr/0001-uv.md)
-- O módulo de log se chama `logger.py`, não `logging.py`, para não ter o mesmo nome do
+## Escolhas de projeto
+
+- uv como gerenciador de pacotes: um único `uv.lock` serve macOS e Linux, permite escolher o
+  índice do PyTorch por sistema operacional e instala em segundos. Alternativas como
+  `pip` + `requirements.txt` ou Poetry exigiriam arquivos separados por plataforma ou mais
+  configuração.
+- O módulo de log se chama `logger.py` (e não `logging.py`) para não ter o mesmo nome do módulo
   `logging` da biblioteca padrão.
-- O `mscvae.py` foi **só formatado** (ruff format) e teve o import corrigido. Lint e mypy estão
-  desligados para ele via `per-file-ignores`. A limpeza e as correções de verdade são a Fase 1.
+- O arquivo original do modelo (`src/MSCVAE.py`) foi movido para
+  `src/anomaly_service/model/mscvae.py`, e o import quebrado `from src.utils import logger` foi
+  substituído pelo novo módulo de log.
 
-## Como verificar
+## Passo a passo para reproduzir
 
-```bash
-make setup        # venv + uv sync --frozen + git hooks
-make check        # ruff + mypy + pytest
-uv tree --depth 1 # árvore de dependências diretas
-uv run python -c "import torch; print(torch.__version__, torch.backends.mps.is_available())"
-```
+Pré-requisitos: [uv](https://docs.astral.sh/uv/getting-started/installation/) (no macOS:
+`brew install uv`) e `make`.
+
+1. Criar o ambiente e instalar as dependências:
+   ```bash
+   make setup
+   ```
+   Resultado esperado: pasta `.venv` criada e hooks do pre-commit instalados.
+2. Executar todas as verificações:
+   ```bash
+   make check
+   ```
+   Resultado esperado: `All checks passed!` (ruff), `Success: no issues found` (mypy) e todos os
+   testes passando.
+3. (Opcional) Conferir a instalação do PyTorch:
+   ```bash
+   uv run python -c "import torch; print(torch.__version__, torch.backends.mps.is_available())"
+   ```
+   No macOS com Apple Silicon, o segundo valor é `True`.
