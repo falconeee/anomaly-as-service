@@ -1,0 +1,31 @@
+# Server Machine Dataset, machine-1-1 (38 metrics, 8 constant ones dropped -> 30).
+# Paper-like multi-scale windows {10, 30, 60}. ~28k training windows: a few minutes per
+# epoch on CPU, much faster on MPS/CUDA.
+experiment: mscvae-smd
+registered_model: mscvae-smd
+
+data:
+  source: smd
+  machine: machine-1-1
+  data_dir: data/smd
+  drop_constant: true
+
+model:
+  window_sizes: [10, 30, 60]
+  stride: 1
+  seq_len: 5
+  seed: 42
+
+training:
+  epochs: 20
+  batch_size: 128
+  lr: 0.001
+  # Hold out the last 20% of training to calibrate the threshold on unseen normal data.
+  calibration_fraction: 0.2
+  device: auto
+
+promotion:
+  metric: f1
+  tolerance: 0.01
+  max_latency_ms: 5000
+  latency_rows: 1000

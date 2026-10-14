@@ -1,61 +1,86 @@
 # Visão geral
 
+Este diretório documenta, etapa por etapa, como o serviço foi montado e como reproduzir cada
+etapa. Os guias podem ser lidos em ordem (do ambiente de desenvolvimento até o monitoramento) ou
+de forma independente, consultando apenas o tema de interesse.
+
 ## O problema
 
-Recebemos uma série temporal **multivariada** (ex.: 38 métricas de um servidor) e queremos saber
-**quando** o sistema se comportou de forma anormal e **por quê**: quais variáveis causaram a
-anomalia, quanto elas desviaram do normal, e se o problema foi de magnitude (um valor estourou)
-ou de relação (duas métricas que andavam juntas se descolaram).
+Um sistema monitorado (um servidor, uma máquina industrial, uma aplicação) gera várias métricas
+ao mesmo tempo: CPU, memória, temperatura, latência etc. Isso é uma **série temporal
+multivariada**: uma tabela com uma linha por instante e uma coluna por variável.
 
-## O modelo (MSCVAE), em uma página
+O objetivo é responder três perguntas:
 
-1. **Matrizes de atributos multiescala.** Para cada instante, o `AttributeMatrixGenerator`
-   calcula `M = X·Xᵀ / w` sobre janelas de 10, 30 e 60 pontos. Cada matriz N×N descreve como as
-   N variáveis se correlacionam naquela escala de tempo.
-2. **Encoder CNN + núcleo VAE.** O encoder comprime as matrizes num espaço latente
-   probabilístico (μ, σ) que aprende o que é o "normal".
-3. **Transformer temporal.** Olha a sequência das últimas `seq_len` janelas e captura a inércia
-   do sistema.
-4. **Decoder duplo (híbrido).** Uma rota reconstrói as matrizes (sensível a quebras de
-   correlação) e outra reconstrói os valores brutos (sensível a picos).
-5. **Score φ.** É o erro de reconstrução das duas rotas, ponderado pelas precisões que o próprio
-   modelo aprende (Kendall et al.).
-6. **Limiar por EVT (SPOT).** Uma distribuição de Pareto generalizada é ajustada na cauda dos
-   scores de treino. O limiar fica no quantil de probabilidade `q = 1e-4`, sem supor que o erro é
-   gaussiano.
-7. **RCA.** O erro de cada variável é padronizado contra o próprio baseline (mediana + MAD) e
-   separado em três canais: diagonal (a variável sozinha), fora da diagonal (as relações dela) e
-   valor bruto.
+1. **Quando** o sistema se comportou de forma anormal?
+2. **Quão grave** foi?
+3. **Por quê**: quais variáveis causaram a anomalia, e se o problema foi um valor fora do comum
+   (*magnitude*) ou uma mudança na forma como as variáveis se relacionam (*correlação*)?
 
-## A arquitetura do serviço
+## O modelo (MSCVAE) em linguagem simples
+
+1. **Matrizes de correlação em várias escalas.** Para cada instante, o modelo olha as últimas 10,
+   30 e 60 medições e calcula o quanto cada par de variáveis se move junto. O resultado é uma
+   "fotografia" das relações entre as variáveis naquele momento.
+2. **Aprender o normal.** Uma rede neural (um *autoencoder variacional*) é treinada só com dados
+   normais para comprimir e reconstruir essas fotografias e os valores brutos.
+3. **Medir a surpresa.** Em dados novos, o erro de reconstrução vira o **score** de anomalia:
+   quanto pior o modelo consegue reconstruir, mais incomum é o momento.
+4. **Decidir o que é anômalo.** O **limiar** (*threshold*) é calculado com Teoria de Valores
+   Extremos (algoritmo SPOT): ele modela os erros mais altos observados em dados normais e escolhe
+   um valor que dados normais só ultrapassariam com probabilidade de 1 em 10.000.
+5. **Explicar.** O erro de cada variável é comparado com o erro típico dela mesma. As variáveis
+   que mais se desviaram do próprio normal são apontadas como causas.
+
+## Arquitetura do serviço
 
 ```
-                 ┌──────────── docker compose ─────────────────────────────┐
- cliente ──HTTP──▶ api (FastAPI) ──enqueue──▶ redis ◀──consume── worker (Celery)
-                 │   │ sync /v1/detect            (broker+results)   │      │
-                 │   └──── InferenceService ◀── models:/mscvae-smd@champion ┘
-                 │                                   ▲                      │
-                 │ trainer (one-off) ──log/register──▶ mlflow ──▶ postgres (metadata)
-                 │                                     └──────▶ minio (artefatos S3)
-                 │ [profile monitoring] prometheus ──▶ grafana              │
-                 └─────────────────────────────────────────────────────────┘
+                 ┌──────────────────────── docker compose ───────────────────────────┐
+ cliente ──HTTP──▶ api (FastAPI) ──enfileira──▶ redis ◀──consome── worker (Celery)   │
+                 │   │ POST /v1/detect          (fila + resultados)      │            │
+                 │   └──▶ InferenceService ◀── models:/<nome>@champion ──┘            │
+                 │                                   ▲  (recarga automática)          │
+                 │ trainer (job avulso) ──registra e promove──▶ mlflow ──▶ postgres   │
+                 │                                                  └──▶ volume       │
+                 │ [perfil monitoring] prometheus ──▶ grafana       (artefatos)      │
+                 └────────────────────────────────────────────────────────────────────┘
 ```
 
-## Roteiro de fases
+- **api**: recebe as séries e responde com as anomalias. Para séries grandes, envia o trabalho
+  para a fila.
+- **worker**: processa os trabalhos da fila com o mesmo código da API.
+- **mlflow**: guarda o histórico de treinos e as versões dos modelos.
+- **trainer**: treina um modelo, registra no MLflow e decide se ele substitui o atual.
 
-| Fase | Tema | O que você aprende |
+## Roteiro das etapas
+
+| Etapa | Guia | Tema |
 |---|---|---|
-| 0 | [Fundação](fase-0-fundacao.md) | uv, lockfile, grupos de dependências, src-layout, ruff, pre-commit |
-| 1 | Modelo pronto para produção | Serialização segura, reprodutibilidade, testes de código de ML |
-| 2 | Dados, treino e avaliação | Experiment tracking, pyfunc, métricas de anomalia em séries temporais |
-| 3 | Versionamento | Model Registry, aliases, quality gate, linhagem, rollback |
-| 4 | API síncrona | FastAPI lifespan, DI, Pydantic v2, CPU-bound num servidor async |
-| 5 | Filas | Celery, at-least-once, idempotência, backpressure |
-| 6 | Containers | Docker multi-stage com uv, compose, healthchecks, MLflow com S3 |
-| 7 | CI/CD | GitHub Actions, cache, teste e2e, GHCR |
-| 8 | Observabilidade | Prometheus/Grafana, logs estruturados, drift |
-| 9 | Portfólio | README, model card, ADRs |
+| 0 | [Fundação](fase-0-fundacao.md) | Ambiente Python com uv, organização do código, ferramentas de qualidade |
+| 1 | [Modelo pronto para produção](fase-1-modelo.md) | Salvar e carregar o modelo com segurança, reprodutibilidade, testes |
+| 2 | [Treino e avaliação](fase-2-treino-mlflow.md) | Pipeline de treino, métricas, registro de experimentos no MLflow, dados próprios |
+| 3 | [Versionamento](fase-3-registry.md) | Versões de modelo, promoção automática, rollback |
+| 4 | [API](fase-4-api.md) | Endpoints, validação, eventos e explicações |
+| 5 | [Filas](fase-5-filas.md) | Processamento assíncrono com Celery e Redis |
+| 6 | [Containers](fase-6-containers.md) | Imagens Docker e a stack completa com Compose |
+| 7 | [CI/CD](fase-7-cicd.md) | Testes automáticos e publicação de imagens no GitHub |
+| 8 | [Observabilidade](fase-8-observabilidade.md) | Métricas, dashboard e logs |
 
-Cada fase tem um guia em `docs/fase-N-*.md` com **O que construímos**, **Conceitos**,
-**Decisões** e **Como verificar**. As decisões de arquitetura ficam registradas em
-[`docs/adr/`](adr/).
+## Glossário
+
+| Termo | Significado |
+|---|---|
+| Janela | Trecho com as últimas N medições, usado para calcular uma "fotografia" do sistema |
+| Score (φ) | Número que mede o quão incomum é um instante; maior significa mais anômalo |
+| Limiar (*threshold*) | Valor de score acima do qual um instante é considerado anômalo |
+| SPOT / EVT | Método estatístico que define o limiar a partir dos valores extremos dos dados normais |
+| Evento | Período contínuo de instantes anômalos, reportado como uma única anomalia |
+| RCA (*root cause analysis*) | Análise de causa raiz: quais variáveis explicam a anomalia |
+| Aquecimento (*warm-up*) | Primeiros pontos de uma série, sem histórico suficiente para uma avaliação confiável |
+| MLflow | Ferramenta que registra treinos (parâmetros, métricas, arquivos) e versiona modelos |
+| Model Registry | Catálogo de modelos do MLflow, com versões numeradas (1, 2, 3...) |
+| Alias | Apelido que aponta para uma versão: `@champion` (em produção) e `@challenger` (candidato) |
+| Quality gate | Regra que decide se o candidato substitui o modelo em produção |
+| Fila / broker | Lista de trabalhos pendentes (aqui, no Redis), consumida pelos workers |
+| Worker | Processo que executa os trabalhos da fila |
+| Hot reload | Troca do modelo em uso sem reiniciar o serviço |

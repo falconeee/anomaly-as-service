@@ -1,0 +1,21 @@
+# Only what the image build needs: pyproject.toml, uv.lock, README.md, src/, configs/, docker/
+.git
+.github
+.venv
+**/__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+coverage.xml
+data
+mlruns
+mlartifacts
+mlflow.db
+artifacts
+examples
+docs
+tests
+monitoring
+.env
+.DS_Store

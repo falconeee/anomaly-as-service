@@ -1,0 +1,32 @@
+# Fast end-to-end config: synthetic data, small windows, few epochs.
+# Used by tests, CI and the "quick start" in the README (~1 min on a laptop CPU).
+experiment: mscvae-synthetic
+registered_model: mscvae-synthetic
+
+data:
+  source: synthetic
+  n_train: 3000
+  n_test: 1500
+  n_features: 8
+  n_anomalies: 4
+  seed: 0
+
+model:
+  window_sizes: [5, 10, 20]
+  stride: 1
+  seq_len: 3
+  seed: 42
+
+training:
+  epochs: 10
+  batch_size: 128
+  lr: 0.001
+  # Hold out the last 20% of training to calibrate the threshold on unseen normal data.
+  calibration_fraction: 0.2
+  device: auto
+
+promotion:
+  metric: f1
+  tolerance: 0.01
+  max_latency_ms: 2000
+  latency_rows: 1000
