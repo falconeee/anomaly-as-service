@@ -1,0 +1,87 @@
+[project]
+name = "anomaly-service"
+version = "0.1.0"
+description = "Anomaly detection as a service: multivariate time-series anomalies with root-cause explanations (MSCVAE + FastAPI + Celery + MLflow)."
+readme = "README.md"
+authors = [{ name = "Gabriel Falcone" }]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "boto3>=1.43.113",
+    "celery[redis]>=5.6.3",
+    "fastapi>=0.143.0",
+    "httpx>=0.28.1",
+    "mlflow-skinny>=3.17.1",
+    "numpy>=2.5.4",
+    "pandas>=3.0.6",
+    "prometheus-fastapi-instrumentator>=8.1.0",
+    "pydantic>=2.14.1",
+    "pydantic-settings>=2.15.0",
+    "pyyaml>=6.0.3",
+    "redis>=6.4.0",
+    "scipy>=1.18.1",
+    "torch>=2.14.1",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+# ---------------------------------------------------------------------------
+# uv
+# ---------------------------------------------------------------------------
+[tool.uv]
+# Only resolve the lockfile for the platforms we actually run on:
+# macOS (local development, MPS) and Linux (Docker images / CI).
+environments = ["sys_platform == 'darwin'", "sys_platform == 'linux'"]
+# `uv sync` installs these groups by default (local development). Docker images opt out
+# with `--no-default-groups` and only pick what they need.
+default-groups = ["dev", "train"]
+
+# PyTorch publishes CPU-only wheels on its own index. They are much smaller than
+# the default Linux (CUDA) wheels, which keeps the Docker images lean.
+# `explicit = true` means this index is ONLY used for packages that opt in below.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "NPY"]
+
+[tool.ruff.lint.per-file-ignores]
+# The research model keeps its original style for now; it gets cleaned up in Phase 1.
+"src/anomaly_service/model/mscvae.py" = ["E", "W", "B", "UP", "SIM", "NPY", "F401", "F841", "I001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+exclude = ["src/anomaly_service/model/mscvae.py"]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.0",
+    "pre-commit>=4.7.0",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.0",
+]
+train = [
+    "matplotlib>=3.11.2",
+    "mlflow>=3.17",
+]
