@@ -4,187 +4,187 @@
 ![Python 3.12](https://img.shields.io/badge/python-3.12-blue)
 ![uv](https://img.shields.io/badge/deps-uv-purple)
 
-Serviço de detecção de anomalias em séries temporais com **explicação**. Ele recebe as medições de
-um sistema (por exemplo, CPU, memória e latência de um servidor ao longo do tempo) e responde
-**quando** algo saiu do normal, **quão grave** foi e **quais variáveis** causaram o problema.
+Time series anomaly detection service with **explanations**. It receives a system's
+measurements (for example, a server's CPU, memory and latency over time) and answers
+**when** something went out of normal, **how severe** it was and **which variables** caused the problem.
 
-O projeto cobre o ciclo completo de um modelo de machine learning em produção: treino, avaliação,
-versionamento, API, processamento em fila, containers, CI/CD e monitoramento.
+The project covers the full lifecycle of a machine learning model in production: training, evaluation,
+versioning, API, queue processing, containers, CI/CD and monitoring.
 
-## Sumário
+## Contents
 
-1. [O problema](#1-o-problema)
-2. [A solução em resumo](#2-a-solução-em-resumo)
-3. [Como funciona](#3-como-funciona)
-4. [Tecnologias utilizadas](#4-tecnologias-utilizadas)
-5. [Como utilizar o serviço](#5-como-utilizar-o-serviço)
-6. [Como trabalhar com novos dados](#6-como-trabalhar-com-novos-dados)
-7. [Resultados](#7-resultados)
-8. [Desenvolvimento sem Docker](#8-desenvolvimento-sem-docker)
-9. [Configuração](#9-configuração)
-10. [Monitoramento](#10-monitoramento)
-11. [Estrutura do repositório](#11-estrutura-do-repositório)
-12. [Limitações e próximos passos](#12-limitações-e-próximos-passos)
-13. [Documentação detalhada](#13-documentação-detalhada)
+1. [The problem](#1-the-problem)
+2. [The solution in short](#2-the-solution-in-short)
+3. [How it works](#3-how-it-works)
+4. [Technologies used](#4-technologies-used)
+5. [How to use the service](#5-how-to-use-the-service)
+6. [How to work with new data](#6-how-to-work-with-new-data)
+7. [Results](#7-results)
+8. [Development without Docker](#8-development-without-docker)
+9. [Configuration](#9-configuration)
+10. [Monitoring](#10-monitoring)
+11. [Repository structure](#11-repository-structure)
+12. [Limitations and next steps](#12-limitations-and-next-steps)
+13. [Detailed documentation](#13-detailed-documentation)
 
 ---
 
-## 1. O problema
+## 1. The problem
 
-Sistemas monitorados geram várias métricas ao mesmo tempo. Essas métricas formam uma **série
-temporal multivariada**: uma tabela com uma linha por instante e uma coluna por variável.
+Monitored systems produce many metrics at the same time. Those metrics form a **multivariate
+time series**: a table with one row per instant and one column per variable.
 
-| timestamp | cpu | memória | latência_ms |
+| timestamp | cpu | memory | latency_ms |
 |---|---|---|---|
 | 10:00 | 41 | 63 | 120 |
 | 10:01 | 40 | 63 | 119 |
 | 10:02 | 97 | 64 | 380 |
 
-Detectar problemas nesses dados é difícil por dois motivos:
+Detecting problems in this data is hard for two reasons:
 
-- **Limites fixos por variável não bastam.** Alguns problemas não aparecem em nenhuma variável
-  isolada: todas ficam em faixas normais, mas deixam de se comportar como costumam *juntas*
-  (por exemplo, o tráfego sobe e a CPU não acompanha).
-- **Saber que algo está errado não basta.** Quem recebe o alerta precisa saber **onde olhar**:
-  quais variáveis causaram a anomalia e o quanto se desviaram.
+- **Fixed per-variable limits are not enough.** Some problems do not show up in any single
+  variable: all of them stay within normal ranges, but they stop behaving as they usually do *together*
+  (for example, traffic goes up and CPU does not follow).
+- **Knowing that something is wrong is not enough.** Whoever receives the alert needs to know **where to look**:
+  which variables caused the anomaly and by how much they deviated.
 
-## 2. A solução em resumo
+## 2. The solution in short
 
 ```
-série temporal (JSON) ──▶ API ──▶ modelo MSCVAE ──▶ anomalias com explicação (JSON)
+time series (JSON) ──▶ API ──▶ MSCVAE model ──▶ anomalies with explanations (JSON)
 ```
 
-Para cada anomalia, a resposta informa:
+For each anomaly, the response reports:
 
-| Campo | Exemplo |
+| Field | Example |
 |---|---|
-| Período | de 07:14 a 07:42, pico às 07:26 |
-| Severidade | `high` (score 45 vezes acima do limiar) |
-| Causas | `f04`, responsável por 100% do desvio |
-| Tipo de causa | `magnitude` (valor fora do comum) ou `correlation` (relação com as outras variáveis quebrou) |
-| Observado × esperado | recebido 90,89; o modelo esperava 58,64 |
-| Explicação em texto | "Anomalia de severidade alta entre 07:14 e 07:42 [...] Principais causas: f04 [...]" |
+| Period | from 07:14 to 07:42, peak at 07:26 |
+| Severity | `high` (score 45 times above the threshold) |
+| Causes | `f04`, responsible for 100% of the deviation |
+| Cause type | `magnitude` (unusual value) or `correlation` (the relationship with the other variables broke) |
+| Observed × expected | received 90.89; the model expected 58.64 |
+| Text explanation | "Anomalia de severidade alta entre 07:14 e 07:42 [...] Principais causas: f04 [...]" (Portuguese by default; English with `language: en`) |
 
-## 3. Como funciona
+## 3. How it works
 
-### 3.1 O modelo (MSCVAE)
+### 3.1 The model (MSCVAE)
 
-1. **Fotografias das relações.** Para cada instante, o modelo pega as últimas 10, 30 e 60
-   medições e calcula o quanto cada par de variáveis se move junto (matrizes de correlação em três
-   escalas de tempo).
-2. **Aprender o normal.** Uma rede neural (*autoencoder variacional* com camadas convolucionais e
-   um *Transformer*) é treinada apenas com dados normais para comprimir e reconstruir essas
-   fotografias e os valores brutos.
-3. **Medir a surpresa.** Em dados novos, o **erro de reconstrução** vira o score de anomalia. O que
-   a rede nunca viu, ela reconstrói mal.
-4. **Definir o limiar.** O limiar é calculado com Teoria de Valores Extremos (algoritmo SPOT): a
-   partir dos maiores erros observados em dados normais **não usados no treino**, escolhe-se um
-   valor que dados normais só ultrapassariam com probabilidade de 1 em 10.000.
-5. **Agrupar em eventos.** Instantes consecutivos acima do limiar formam um evento. A severidade
-   depende de quantas vezes o score superou o limiar (`low` < 1,5×, `medium` < 3×, `high` ≥ 3×).
-6. **Explicar.** O erro de cada variável é comparado com o erro típico **dela mesma**. São causas
-   as variáveis que desviaram muito do próprio normal e se destacaram em relação às demais. A
-   explicação em texto é montada a partir desses números, sem modelo de linguagem: a mesma entrada
-   sempre gera a mesma explicação.
+1. **Snapshots of the relationships.** For each instant, the model takes the last 10, 30 and 60
+   measurements and computes how much each pair of variables moves together (correlation matrices at three
+   time scales).
+2. **Learning normal.** A neural network (a *variational autoencoder* with convolutional layers and
+   a *Transformer*) is trained on normal data only to compress and reconstruct those
+   snapshots and the raw values.
+3. **Measuring surprise.** On new data, the **reconstruction error** becomes the anomaly score. What
+   the network has never seen, it reconstructs poorly.
+4. **Setting the threshold.** The threshold is computed with Extreme Value Theory (the SPOT algorithm): from
+   the largest errors observed on normal data **not used in training**, it picks a
+   value that normal data would only exceed with a probability of 1 in 10,000.
+5. **Grouping into events.** Consecutive instants above the threshold form an event. The severity
+   depends on how many times the score exceeded the threshold (`low` < 1.5×, `medium` < 3×, `high` ≥ 3×).
+6. **Explaining.** Each variable's error is compared with **its own** typical error. The causes are
+   the variables that deviated a lot from their own normal and stood out relative to the others. The
+   text explanation is built from those numbers, without a language model: the same input
+   always produces the same explanation.
 
-### 3.2 A arquitetura
+### 3.2 The architecture
 
 ```mermaid
 flowchart LR
-    C([Cliente]) -->|POST /v1/detect<br/>resposta imediata| API
-    C -->|POST /v1/jobs<br/>séries grandes| API
-    API[API<br/>FastAPI] -->|enfileira| R[(Redis<br/>fila e resultados)]
+    C([Client]) -->|POST /v1/detect<br/>immediate response| API
+    C -->|POST /v1/jobs<br/>large series| API
+    API[API<br/>FastAPI] -->|enqueues| R[(Redis<br/>queue and results)]
     R --> W[Worker<br/>Celery]
-    API -. "carrega o modelo<br/>@champion" .-> M
-    W -. "carrega o modelo<br/>@champion" .-> M
-    T[Trainer<br/>executado sob demanda] -->|registra e promove| M[MLflow<br/>experimentos e<br/>catálogo de modelos]
+    API -. "loads the model<br/>@champion" .-> M
+    W -. "loads the model<br/>@champion" .-> M
+    T[Trainer<br/>run on demand] -->|registers and promotes| M[MLflow<br/>experiments and<br/>model catalog]
     M --> PG[(Postgres)]
-    M --> V[(Volume<br/>arquivos dos modelos)]
-    P[Prometheus] -->|coleta métricas| API
+    M --> V[(Volume<br/>model files)]
+    P[Prometheus] -->|scrapes metrics| API
     P --> W
     G[Grafana] --> P
 ```
 
-| Componente | Função |
+| Component | Role |
 |---|---|
-| API | Recebe as séries, responde na hora (séries pequenas) ou enfileira (séries grandes) |
-| Worker | Processa a fila com exatamente o mesmo código da API |
-| Trainer | Treina um modelo, avalia, registra no MLflow e decide se ele entra em produção |
-| MLflow | Guarda o histórico de treinos e as versões dos modelos |
-| Redis | Fila de trabalhos e armazenamento dos resultados |
-| Prometheus + Grafana | Métricas e dashboard |
+| API | Receives the series, answers right away (small series) or enqueues them (large series) |
+| Worker | Processes the queue with exactly the same code as the API |
+| Trainer | Trains a model, evaluates it, registers it in MLflow and decides whether it goes into production |
+| MLflow | Keeps the training history and the model versions |
+| Redis | Job queue and result storage |
+| Prometheus + Grafana | Metrics and dashboard |
 
-### 3.3 O ciclo de vida do modelo
+### 3.3 The model lifecycle
 
 ```
-treino ─▶ avaliação ─▶ registro no MLflow como nova versão (apelido @challenger)
+training ─▶ evaluation ─▶ registered in MLflow as a new version (alias @challenger)
                                 │
-                                ▼  regra de promoção: candidato × modelo atual, nos mesmos dados
-           a métrica do candidato é pelo menos tão boa quanto a do atual (com tolerância)
-           e o tempo de resposta está dentro do limite?
-                 │ sim                               │ não
+                                ▼  promotion rule: candidate × current model, on the same data
+           is the candidate's metric at least as good as the current one's (with tolerance)
+           and is the response time within the limit?
+                 │ yes                               │ no
                  ▼                                   ▼
-   @champion passa a apontar para a nova versão   nada muda; o motivo fica registrado
+   @champion now points to the new version       nothing changes; the reason is recorded
                  │
                  ▼
-   API e workers trocam de modelo sozinhos, sem reiniciar
+   API and workers switch models by themselves, without restarting
 ```
 
-- `@champion` é a versão em produção; `@challenger` é a candidata mais recente.
-- Voltar para uma versão anterior (rollback) é apenas mover o `@champion`.
-- Cada versão guarda o commit do código, o hash dos dados, a configuração, as métricas e a decisão
-  de promoção.
+- `@champion` is the version in production; `@challenger` is the most recent candidate.
+- Going back to a previous version (rollback) just means moving `@champion`.
+- Each version stores the code commit, the data hash, the configuration, the metrics and the promotion
+  decision.
 
-## 4. Tecnologias utilizadas
+## 4. Technologies used
 
-| Tecnologia | Uso no projeto |
+| Technology | Use in the project |
 |---|---|
-| **Python 3.12** + **uv** | Linguagem e gerenciador de dependências, com versões travadas em `uv.lock` |
-| **PyTorch** | Rede neural do modelo (GPU do Mac no desenvolvimento, CPU nos containers) |
-| **pandas**, **NumPy**, **SciPy** | Manipulação dos dados e cálculo do limiar estatístico |
-| **FastAPI** + **Pydantic** | API HTTP e validação das requisições |
-| **Celery** + **Redis** | Fila para processamento em segundo plano |
-| **MLflow** | Registro de experimentos, catálogo de versões de modelos e promoção |
-| **PostgreSQL** | Banco de dados do MLflow |
-| **Docker** + **Docker Compose** | Empacotamento e execução de toda a infraestrutura |
-| **GitHub Actions** | Testes automáticos e publicação de imagens |
-| **Prometheus** + **Grafana** | Coleta de métricas e dashboard |
-| **pytest**, **ruff**, **mypy**, **pre-commit** | Testes, padrão de código e verificação de tipos |
+| **Python 3.12** + **uv** | Language and dependency manager, with versions locked in `uv.lock` |
+| **PyTorch** | The model's neural network (Mac GPU in development, CPU in the containers) |
+| **pandas**, **NumPy**, **SciPy** | Data handling and computing the statistical threshold |
+| **FastAPI** + **Pydantic** | HTTP API and request validation |
+| **Celery** + **Redis** | Queue for background processing |
+| **MLflow** | Experiment tracking, model version catalog and promotion |
+| **PostgreSQL** | MLflow's database |
+| **Docker** + **Docker Compose** | Packaging and running the whole infrastructure |
+| **GitHub Actions** | Automated tests and image publishing |
+| **Prometheus** + **Grafana** | Metric collection and dashboard |
+| **pytest**, **ruff**, **mypy**, **pre-commit** | Tests, code style and type checking |
 
-## 5. Como utilizar o serviço
+## 5. How to use the service
 
-### 5.1 Pré-requisitos
+### 5.1 Prerequisites
 
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (ou Docker Engine com Compose)
-- `make` (já disponível no macOS e na maioria das distribuições Linux)
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or Docker Engine with Compose)
+- `make` (already available on macOS and most Linux distributions)
 
-No macOS, se o comando `docker` não for encontrado no terminal, adicione
-`/Applications/Docker.app/Contents/Resources/bin` ao `PATH`.
+On macOS, if the `docker` command is not found in the terminal, add
+`/Applications/Docker.app/Contents/Resources/bin` to `PATH`.
 
-### 5.2 Subir o serviço
+### 5.2 Start the service
 
 ```bash
 git clone https://github.com/falconeee/anomaly-as-service.git
 cd anomaly-as-service
-make up             # constrói as imagens e sobe API, worker, MLflow, Postgres e Redis
-make train-docker   # treina um modelo de demonstração (dados sintéticos) e o coloca em produção
-make e2e            # (opcional) testa tudo de ponta a ponta; termina com "E2E OK"
+make up             # builds the images and starts API, worker, MLflow, Postgres and Redis
+make train-docker   # trains a demo model (synthetic data) and puts it into production
+make e2e            # (optional) tests everything end to end; ends with "E2E OK"
 ```
 
-O primeiro `make up` baixa o PyTorch e pode levar alguns minutos.
+The first `make up` downloads PyTorch and may take a few minutes.
 
-| Interface | Endereço |
+| Interface | Address |
 |---|---|
-| Documentação interativa da API | http://localhost:8000/docs |
-| MLflow (treinos e versões) | http://localhost:5050 |
-| Grafana (após `make monitoring`) | http://localhost:3000 |
+| Interactive API documentation | http://localhost:8000/docs |
+| MLflow (training runs and versions) | http://localhost:5050 |
+| Grafana (after `make monitoring`) | http://localhost:3000 |
 
-A chave de acesso padrão da API é `change-me`. Para alterá-la, copie `.env.example` para `.env` e
-edite `API_KEY`.
+The API's default access key is `change-me`. To change it, copy `.env.example` to `.env` and
+edit `API_KEY`.
 
-### 5.3 Enviar uma série para análise
+### 5.3 Send a series for analysis
 
-O corpo da requisição tem uma lista de valores **por variável** e, opcionalmente, os timestamps:
+The request body has a list of values **per variable** and, optionally, the timestamps:
 
 ```json
 {
@@ -197,7 +197,7 @@ O corpo da requisição tem uma lista de valores **por variável** e, opcionalme
 }
 ```
 
-Exemplo com o arquivo incluído no repositório (1.500 pontos, 8 variáveis, 4 anomalias inseridas):
+Example with the file included in the repository (1,500 points, 8 variables, 4 injected anomalies):
 
 ```bash
 curl -s -X POST localhost:8000/v1/detect \
@@ -205,18 +205,18 @@ curl -s -X POST localhost:8000/v1/detect \
   -d @examples/request_synthetic.json
 ```
 
-Regras da requisição:
+Request rules:
 
-- os nomes das variáveis devem ser os mesmos usados no treino (`GET /v1/models/current` lista
-  quais são); a ordem não importa e variáveis extras são ignoradas;
-- todas as listas devem ter o mesmo tamanho;
-- valores ausentes podem ser enviados como `null`;
-- os primeiros pontos (59 no modelo SMD, 19 no de demonstração: a maior janela menos 1) servem de
-  histórico e não geram alertas (`warmup_points`). Envie a série com histórico suficiente antes do trecho de interesse.
+- the variable names must be the same ones used in training (`GET /v1/models/current` lists
+  them); the order does not matter and extra variables are ignored;
+- all lists must have the same length;
+- missing values can be sent as `null`;
+- the first points (59 for the SMD model, 19 for the demo one: the largest window minus 1) serve as
+  history and do not raise alerts (`warmup_points`). Send the series with enough history before the stretch of interest.
 
-### 5.4 Entender a resposta
+### 5.4 Understand the response
 
-Resposta real (resumida) para o exemplo acima:
+Real (abridged) response for the example above:
 
 ```json
 {
@@ -242,85 +242,85 @@ Resposta real (resumida) para o exemplo acima:
 }
 ```
 
-| Campo | Significado |
+| Field | Meaning |
 |---|---|
-| `model` | Modelo e versão que produziram a resposta |
-| `threshold` | Limiar de score do modelo |
-| `warmup_points` | Pontos iniciais usados só como histórico |
-| `ignored_features` | Variáveis enviadas que o modelo não usa |
-| `start_index`, `end_index`, `peak_index` | Posições (linha) de início, fim e pico da anomalia na série enviada |
-| `start`, `end`, `peak` | Os mesmos instantes em data/hora (quando os timestamps são enviados) |
-| `threshold_ratio` | Quantas vezes o maior score do evento superou o limiar |
-| `severity` | `low` (< 1,5×), `medium` (< 3×) ou `high` (≥ 3×) |
-| `root_causes[].contribution_pct` | Parcela da anomalia atribuída à variável |
-| `root_causes[].peak_z` | Quantos desvios-padrão o erro da variável ficou acima do erro normal dela |
-| `root_causes[].kind` | `magnitude`: o valor saiu do comum. `correlation`: a relação com as demais variáveis mudou |
-| `root_causes[].observed`, `expected` | Valor recebido e valor que o modelo considera normal |
-| `explanation` | Resumo em texto (português ou inglês) |
+| `model` | Model and version that produced the response |
+| `threshold` | The model's score threshold |
+| `warmup_points` | Initial points used only as history |
+| `ignored_features` | Variables sent that the model does not use |
+| `start_index`, `end_index`, `peak_index` | Positions (row) of the anomaly's start, end and peak in the series sent |
+| `start`, `end`, `peak` | The same instants as date/time (when timestamps are sent) |
+| `threshold_ratio` | How many times the event's highest score exceeded the threshold |
+| `severity` | `low` (< 1.5×), `medium` (< 3×) or `high` (≥ 3×) |
+| `root_causes[].contribution_pct` | Share of the anomaly attributed to the variable |
+| `root_causes[].peak_z` | How many standard deviations the variable's error was above its normal error |
+| `root_causes[].kind` | `magnitude`: the value was unusual. `correlation`: the relationship with the other variables changed |
+| `root_causes[].observed`, `expected` | Value received and value the model considers normal |
+| `explanation` | Text summary (Portuguese or English) |
 
-### 5.5 Opções da requisição
+### 5.5 Request options
 
-| Opção | Padrão | Efeito |
+| Option | Default | Effect |
 |---|---|---|
-| `top_k` | 3 | Número máximo de causas por anomalia |
-| `z_thresh` | 3.0 | Desvio mínimo para uma variável ser considerada causa |
-| `max_gap` | 5 | Trechos anômalos separados por até esse número de janelas normais viram um só evento |
-| `include_scores` | false | Inclui o score de cada ponto na resposta |
-| `include_warmup` | false | Também procura anomalias nos pontos iniciais |
-| `language` | `pt` | Idioma da explicação: `pt` ou `en` |
+| `top_k` | 3 | Maximum number of causes per anomaly |
+| `z_thresh` | 3.0 | Minimum deviation for a variable to be considered a cause |
+| `max_gap` | 5 | Anomalous stretches separated by up to this many normal windows become a single event |
+| `include_scores` | false | Includes each point's score in the response |
+| `include_warmup` | false | Also looks for anomalies in the initial points |
+| `language` | `pt` | Language of the explanation: `pt` or `en` |
 
-### 5.6 Séries grandes: processamento em fila
+### 5.6 Large series: queue processing
 
-Acima de 20.000 pontos (`SYNC_MAX_POINTS`), `/v1/detect` responde **413** e o pedido deve ser
-enviado para a fila:
+Above 20,000 points (`SYNC_MAX_POINTS`), `/v1/detect` responds **413** and the request must be
+sent to the queue:
 
 ```bash
-# 1. Enviar (responde imediatamente com um identificador)
+# 1. Submit (responds immediately with an identifier)
 curl -s -X POST localhost:8000/v1/jobs -H 'X-API-Key: change-me' \
-  -H 'Content-Type: application/json' -H 'Idempotency-Key: pedido-42' \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: request-42' \
   -d @examples/request_synthetic.json
 # {"job_id": "e6722f62...", "status": "queued", "status_url": "/v1/jobs/e6722f62..."}
 
-# 2. Consultar até "succeeded"; o campo "result" tem o mesmo formato de /v1/detect
+# 2. Poll until "succeeded"; the "result" field has the same format as /v1/detect
 curl -s localhost:8000/v1/jobs/e6722f62... -H 'X-API-Key: change-me'
 ```
 
-- `Idempotency-Key` (opcional): reenviar o mesmo pedido com a mesma chave devolve o mesmo trabalho,
-  sem duplicar o processamento.
-- `"callback_url": "https://..."` (opcional, no corpo): o resultado é enviado para esse endereço
-  quando o trabalho termina.
+- `Idempotency-Key` (optional): resending the same request with the same key returns the same job,
+  without duplicating the processing.
+- `"callback_url": "https://..."` (optional, in the body): the result is sent to that address
+  when the job finishes.
 
-### 5.7 Todos os endpoints
+### 5.7 All endpoints
 
-| Método | Rota | Função |
+| Method | Route | Purpose |
 |---|---|---|
-| POST | `/v1/detect` | Análise imediata |
-| POST | `/v1/jobs` | Análise em fila (séries grandes) |
-| GET | `/v1/jobs/{id}` | Situação e resultado de um trabalho |
-| GET | `/v1/models/current` | Modelo em uso, limiar e variáveis esperadas |
-| POST | `/admin/reload` | Recarrega o modelo imediatamente |
-| GET | `/health/live`, `/health/ready` | Processo no ar / modelo carregado |
-| GET | `/metrics` | Métricas no formato do Prometheus |
+| POST | `/v1/detect` | Immediate analysis |
+| POST | `/v1/jobs` | Queued analysis (large series) |
+| GET | `/v1/jobs/{id}` | Status and result of a job |
+| GET | `/v1/models/current` | Model in use, threshold and expected variables |
+| POST | `/admin/reload` | Reloads the model immediately |
+| GET | `/health/live`, `/health/ready` | Process up / model loaded |
+| GET | `/metrics` | Metrics in Prometheus format |
 
-Respostas de erro: **401** (chave ausente ou incorreta), **413** (série grande demais para análise
-imediata), **422** (requisição inválida ou variáveis faltando, listadas em `missing`), **503**
-(ainda não há modelo em produção).
+Error responses: **401** (missing or wrong key), **413** (series too large for immediate
+analysis), **422** (invalid request or missing variables, listed in `missing`), **503**
+(there is no model in production yet).
 
-### 5.8 Parar o serviço
+### 5.8 Stop the service
 
 ```bash
-make down           # para os containers e mantém modelos e histórico
-make clean-docker   # para e apaga todos os dados
+make down           # stops the containers and keeps models and history
+make clean-docker   # stops and deletes all data
 ```
 
-## 6. Como trabalhar com novos dados
+## 6. How to work with new data
 
-Cada modelo aprende o comportamento normal de **um sistema específico**, com um conjunto fixo de
-variáveis. Para monitorar um sistema novo, treina-se um modelo com os dados dele.
+Each model learns the normal behavior of **one specific system**, with a fixed set of
+variables. To monitor a new system, you train a model on its data.
 
-### 6.1 Preparar o arquivo CSV
+### 6.1 Prepare the CSV file
 
-Uma linha por instante e uma coluna por variável:
+One row per instant and one column per variable:
 
 ```
 timestamp,cpu,memoria,latencia_ms,label
@@ -329,244 +329,244 @@ timestamp,cpu,memoria,latencia_ms,label
 2024-01-01T00:02:00,97.1,64.1,380.2,1
 ```
 
-| Coluna | Obrigatória | Observação |
+| Column | Required | Note |
 |---|---|---|
-| `timestamp` | Não | Usada para ordenar as linhas e para exibir datas nas respostas |
-| variáveis numéricas | Sim | Todas as colunas numéricas são usadas, salvo se `features` for definido |
-| `label` | Não | `1` em anomalias conhecidas e `0` no restante; usada **apenas para medir** a qualidade do modelo |
+| `timestamp` | No | Used to sort the rows and to show dates in the responses |
+| numeric variables | Yes | Every numeric column is used, unless `features` is set |
+| `label` | No | `1` on known anomalies and `0` elsewhere; used **only to measure** the model's quality |
 
-Cuidados com os dados:
+Data caveats:
 
-- **O início do arquivo deve ser majoritariamente normal.** As primeiras 70% das linhas treinam o
-  modelo (o que for visto ali será considerado normal); as últimas 30% avaliam o modelo.
-- **Intervalo regular entre medições** (por exemplo, uma linha por minuto). As janelas do modelo
-  são contadas em linhas.
-- **Quantidade de dados:** alguns milhares de linhas no mínimo. O SMD, por exemplo, usa cerca de
-  28 mil linhas para treino.
-- Variáveis que não mudam durante o treino são descartadas automaticamente.
-- Sem a coluna `label`, o modelo é treinado normalmente, mas as métricas de qualidade ficam
-  zeradas e a regra de promoção só verifica o tempo de resposta.
+- **The beginning of the file must be mostly normal.** The first 70% of the rows train the
+  model (whatever is seen there will be considered normal); the last 30% evaluate it.
+- **Regular interval between measurements** (for example, one row per minute). The model's windows
+  are counted in rows.
+- **Amount of data:** a few thousand rows at least. SMD, for example, uses about
+  28 thousand rows for training.
+- Variables that do not change during training are discarded automatically.
+- Without the `label` column, the model trains normally, but the quality metrics are
+  zero and the promotion rule only checks the response time.
 
-Para experimentar o processo sem ter dados próprios, há um CSV de exemplo gerado artificialmente:
+To try the process without your own data, there is an artificially generated sample CSV:
 
 ```bash
-make sample-csv     # cria datasets/exemplo.csv (6 sensores, 4.500 linhas, com coluna label)
+make sample-csv     # creates datasets/exemplo.csv (6 sensors, 4,500 rows, with a label column)
 ```
 
-### 6.2 Criar a configuração do treino
+### 6.2 Create the training configuration
 
-Copie o modelo de configuração e ajuste o caminho do arquivo e o nome do modelo:
+Copy the configuration template and adjust the file path and the model name:
 
 ```bash
-cp configs/train_csv_example.yaml configs/meu_sistema.yaml
+cp configs/train_csv_example.yaml configs/my_system.yaml
 ```
 
 ```yaml
-experiment: meu-sistema
-registered_model: meu-sistema        # nome usado pela API para carregar o modelo
+experiment: my-system
+registered_model: my-system          # name the API uses to load the model
 data:
   source: csv
-  path: datasets/meu_sistema.csv     # coloque o CSV na pasta datasets/
-  timestamp_column: timestamp        # null se não houver
-  label_column: label                # null se não houver
+  path: datasets/my_system.csv       # put the CSV in the datasets/ folder
+  timestamp_column: timestamp        # null if there is none
+  label_column: label                # null if there is none
   test_fraction: 0.3
 model:
-  window_sizes: [5, 10, 20]          # tamanho das janelas, em linhas
+  window_sizes: [5, 10, 20]          # window sizes, in rows
 training:
   epochs: 10
 ```
 
-Ajuste de `window_sizes`: as janelas devem cobrir a duração típica dos padrões do sistema. Com uma
-linha por minuto, `[10, 30, 60]` cobre de 10 minutos a 1 hora; para variações mais lentas, use
-janelas maiores. Mais épocas (`epochs`) costumam melhorar o modelo à custa de mais tempo de treino.
+Tuning `window_sizes`: the windows should cover the typical duration of the system's patterns. With one
+row per minute, `[10, 30, 60]` covers 10 minutes to 1 hour; for slower variations, use
+larger windows. More epochs (`epochs`) usually improve the model at the cost of more training time.
 
-### 6.3 Treinar, avaliar e registrar
+### 6.3 Train, evaluate and register
 
-Com Docker (a pasta `datasets/` é acessível dentro do container de treino):
+With Docker (the `datasets/` folder is accessible inside the training container):
 
 ```bash
-make train-docker CONFIG=configs/meu_sistema.yaml
+make train-docker CONFIG=configs/my_system.yaml
 ```
 
-Sem Docker (registra no MLflow local, ver seção 8):
+Without Docker (registers in the local MLflow, see section 8):
 
 ```bash
-make train CONFIG=configs/meu_sistema.yaml
+make train CONFIG=configs/my_system.yaml
 ```
 
-O comando treina o modelo, calcula as métricas, registra a nova versão no MLflow e aplica a regra
-de promoção. A última linha mostra o resultado, por exemplo
-`promoted=True reason=no champion yet`. As métricas, o gráfico do score e o *model card* podem
-ser consultados em http://localhost:5050, no experimento `meu-sistema`.
+The command trains the model, computes the metrics, registers the new version in MLflow and applies the promotion
+rule. The last line shows the result, for example
+`promoted=True reason=no champion yet`. The metrics, the score plot and the *model card* can
+be viewed at http://localhost:5050, in the `my-system` experiment.
 
-### 6.4 Servir o novo modelo
+### 6.4 Serve the new model
 
-A API serve um modelo por vez, definido pela variável `MODEL_NAME`. Para trocar:
+The API serves one model at a time, set by the `MODEL_NAME` variable. To switch:
 
 ```bash
-echo "MODEL_NAME=meu-sistema" >> .env
-make up             # recria API e worker com o novo modelo
+echo "MODEL_NAME=my-system" >> .env
+make up             # recreates API and worker with the new model
 ```
 
-Confirme com `GET /v1/models/current`, que deve mostrar `"name": "meu-sistema"` e a lista de
-variáveis esperadas.
+Confirm with `GET /v1/models/current`, which should show `"name": "my-system"` and the list of
+expected variables.
 
-### 6.5 Enviar dados do novo sistema
+### 6.5 Send data from the new system
 
-A requisição deve conter as mesmas variáveis do CSV de treino. Para gerar uma requisição a partir
-do trecho de teste do próprio CSV:
+The request must contain the same variables as the training CSV. To generate a request from
+the test portion of the CSV itself:
 
 ```bash
-make request CONFIG=configs/meu_sistema.yaml OUT=request.json
+make request CONFIG=configs/my_system.yaml OUT=request.json
 curl -s -X POST localhost:8000/v1/detect -H 'X-API-Key: change-me' \
   -H 'Content-Type: application/json' -d @request.json
 ```
 
-Em produção, o sistema monitorado envia periodicamente as medições recentes (incluindo o histórico
-de aquecimento) no mesmo formato.
+In production, the monitored system periodically sends its recent measurements (including the warm-up
+history) in the same format.
 
-### 6.6 Treinar novamente
+### 6.6 Retrain
 
-Com mais dados ou outra configuração, basta repetir o passo 6.3. A nova versão só substitui a
-atual se tiver desempenho pelo menos equivalente nos dados de teste, e a API passa a usá-la
-automaticamente em até 15 segundos. Para voltar a uma versão anterior:
+With more data or another configuration, just repeat step 6.3. The new version only replaces the
+current one if it performs at least as well on the test data, and the API starts using it
+automatically within 15 seconds. To go back to a previous version:
 
 ```bash
-docker compose run --rm trainer promote status --model meu-sistema
-docker compose run --rm trainer promote rollback --model meu-sistema --version 1
+docker compose run --rm trainer promote status --model my-system
+docker compose run --rm trainer promote rollback --model my-system --version 1
 ```
 
-## 7. Resultados
+## 7. Results
 
-### Dados sintéticos (modelo de demonstração, ~15 s de treino em CPU)
+### Synthetic data (demo model, ~15 s of CPU training)
 
-| F1 | F1 com point-adjust | AUC-PR | Falsos alarmes | Acerto das causas (HitRate@100%) |
+| F1 | F1 with point-adjust | AUC-PR | False alarms | Cause accuracy (HitRate@100%) |
 |---|---|---|---|---|
-| 0,455 | 0,559 | 0,428 | 3,0% | 1,00 |
+| 0.455 | 0.559 | 0.428 | 3.0% | 1.00 |
 
-O modelo detecta os dois picos e o desvio gradual inseridos nos dados de exemplo, sempre apontando
-a variável correta. A quebra de correlação, a anomalia mais sutil, não é detectada nesta
-configuração reduzida. Calcular o limiar com dados não usados no treino reduziu os falsos alarmes
-de 5,6% para 3,0%.
+The model detects the two spikes and the gradual drift injected into the sample data, always pointing to
+the right variable. The correlation break, the subtlest anomaly, is not detected in this
+reduced configuration. Computing the threshold on data not used in training cut false alarms
+from 5.6% to 3.0%.
 
-### SMD, `machine-1-1` (dataset público de métricas de servidores, Su et al., 2019)
+### SMD, `machine-1-1` (public server-metrics dataset, Su et al., 2019)
 
-| Versão | F1 | F1 com point-adjust | AUC-PR | F1 no melhor limiar | Falsos alarmes | HitRate@100% | HitRate@150% | Promoção |
+| Version | F1 | F1 with point-adjust | AUC-PR | F1 at best threshold | False alarms | HitRate@100% | HitRate@150% | Promotion |
 |---|---|---|---|---|---|---|---|---|
-| v1 | 0,382 | 0,408 | 0,623 | 0,615 | 30,3% | 0,511 | 0,688 | aprovada |
-| v2 | 0,369 | 0,377 | 0,635 | 0,617 | 34,5% | 0,605 | 0,784 | **reprovada** |
+| v1 | 0.382 | 0.408 | 0.623 | 0.615 | 30.3% | 0.511 | 0.688 | approved |
+| v2 | 0.369 | 0.377 | 0.635 | 0.617 | 34.5% | 0.605 | 0.784 | **rejected** |
 
-Leitura dos resultados:
+Reading the results:
 
-- O score distingue bem as anomalias (AUC-PR de 0,63; com o melhor limiar possível, o F1 chegaria
-  a 0,62), e a análise de causa identifica de 60% a 78% das variáveis responsáveis.
-- O limiar fixo gera muitos falsos alarmes porque o período de teste do SMD tem comportamento
-  diferente do período de treino. Ajustar o limiar continuamente é o próximo passo natural.
-- A v2 melhorou a identificação das causas, mas piorou o F1, e por isso foi reprovada pela regra
-  de promoção: a v1 continuou em produção.
+- The score separates the anomalies well (AUC-PR of 0.63; with the best possible threshold, F1 would reach
+  0.62), and the cause analysis identifies 60% to 78% of the responsible variables.
+- The fixed threshold produces many false alarms because SMD's test period behaves
+  differently from its training period. Adjusting the threshold continuously is the natural next step.
+- v2 improved cause identification but worsened F1, so it was rejected by the promotion
+  rule: v1 stayed in production.
 
-Glossário das métricas: F1 equilibra alarmes corretos e anomalias encontradas; *point-adjust*
-conta um trecho anômalo inteiro como encontrado se qualquer ponto dele for detectado (prática comum
-em artigos, mas que infla os números); AUC-PR mede a qualidade do score independentemente do
-limiar; HitRate mede a fração das variáveis causadoras reais entre as primeiras apontadas pelo
-modelo. Mais detalhes em [`docs/fase-2-treino-mlflow.md`](docs/fase-2-treino-mlflow.md).
+Metric glossary: F1 balances correct alarms and anomalies found; *point-adjust*
+counts a whole anomalous stretch as found if any of its points is detected (common practice
+in papers, but it inflates the numbers); AUC-PR measures the score's quality regardless of the
+threshold; HitRate measures the fraction of the real causal variables among the first ones the
+model points to. More details in [`docs/phase-2-training-mlflow.md`](docs/phase-2-training-mlflow.md).
 
-## 8. Desenvolvimento sem Docker
+## 8. Development without Docker
 
-Requisito: [uv](https://docs.astral.sh/uv/) (no macOS: `brew install uv`).
+Requirement: [uv](https://docs.astral.sh/uv/) (on macOS: `brew install uv`).
 
 ```bash
-make setup     # cria o ambiente Python e instala as dependências exatas do uv.lock
-make check     # padrão de código, tipos e testes automatizados
-make train     # treina o modelo de demonstração; MLflow local em mlflow.db
-make mlflow    # interface do MLflow em http://localhost:5050
-make serve     # API em http://localhost:8000 (PORT=8001 se a stack Docker estiver no ar)
-make help      # lista todos os comandos
+make setup     # creates the Python environment and installs the exact dependencies from uv.lock
+make check     # code style, types and automated tests
+make train     # trains the demo model; local MLflow in mlflow.db
+make mlflow    # MLflow UI at http://localhost:5050
+make serve     # API at http://localhost:8000 (PORT=8001 if the Docker stack is up)
+make help      # lists every command
 ```
 
-Neste modo, `/v1/detect` funciona normalmente; `/v1/jobs` precisa do Redis e do worker da stack
-Docker. No Mac, o treino usa a GPU (MPS) automaticamente.
+In this mode, `/v1/detect` works normally; `/v1/jobs` needs Redis and the worker from the Docker
+stack. On a Mac, training uses the GPU (MPS) automatically.
 
-## 9. Configuração
+## 9. Configuration
 
-Variáveis de ambiente, definidas em `.env` (ver [`.env.example`](.env.example)):
+Environment variables, set in `.env` (see [`.env.example`](.env.example)):
 
-| Variável | Padrão | Descrição |
+| Variable | Default | Description |
 |---|---|---|
-| `API_KEY` | `change-me` no Docker; vazia fora dele | Chave exigida no cabeçalho `X-API-Key` (vazia = sem autenticação, só para desenvolvimento) |
-| `MODEL_NAME` | `mscvae-synthetic` | Nome do modelo servido (o `registered_model` da configuração de treino) |
-| `MODEL_ALIAS` | `champion` | Versão servida |
-| `MODEL_REFRESH_INTERVAL_S` | 15 no Docker; 60 fora dele | Intervalo, em segundos, para verificar se há nova versão em produção |
-| `SYNC_MAX_POINTS` | 20000 | Máximo de pontos em `/v1/detect` |
-| `ASYNC_MAX_POINTS` | 500000 | Máximo de pontos em `/v1/jobs` |
-| `LOG_LEVEL` | `INFO` | Nível de detalhe dos logs |
-| `MLFLOW_PORT` | 5050 | Porta do MLflow no computador (a 5000 é usada pelo AirPlay no macOS) |
+| `API_KEY` | `change-me` in Docker; empty outside it | Key required in the `X-API-Key` header (empty = no authentication, for development only) |
+| `MODEL_NAME` | `mscvae-synthetic` | Name of the served model (the `registered_model` from the training configuration) |
+| `MODEL_ALIAS` | `champion` | Served version |
+| `MODEL_REFRESH_INTERVAL_S` | 15 in Docker; 60 outside it | Interval, in seconds, to check for a new version in production |
+| `SYNC_MAX_POINTS` | 20000 | Maximum points in `/v1/detect` |
+| `ASYNC_MAX_POINTS` | 500000 | Maximum points in `/v1/jobs` |
+| `LOG_LEVEL` | `INFO` | Log detail level |
+| `MLFLOW_PORT` | 5050 | MLflow port on the host (5000 is used by AirPlay on macOS) |
 
-## 10. Monitoramento
+## 10. Monitoring
 
 ```bash
-make monitoring     # Prometheus em http://localhost:9090 e Grafana em http://localhost:3000
+make monitoring     # Prometheus at http://localhost:9090 and Grafana at http://localhost:3000
 ```
 
-O dashboard do Grafana mostra:
+The Grafana dashboard shows:
 
-- **saúde do serviço:** requisições por segundo, tempo de resposta, taxa de erros, trabalhos na
-  fila;
-- **comportamento do modelo:** versão em uso, anomalias por minuto, evolução dos scores e mudança
-  nos dados recebidos em relação aos dados de treino.
+- **service health:** requests per second, response time, error rate, jobs in the
+  queue;
+- **model behavior:** version in use, anomalies per minute, score trends and drift
+  in the incoming data relative to the training data.
 
-As métricas do modelo existem porque um serviço pode estar rápido e sem erros e ainda assim errar:
-se os dados mudam, o modelo deixa de representar o sistema. Detalhes em
-[`docs/fase-8-observabilidade.md`](docs/fase-8-observabilidade.md).
+The model metrics exist because a service can be fast and error-free and still be wrong:
+if the data changes, the model no longer represents the system. Details in
+[`docs/phase-8-observability.md`](docs/phase-8-observability.md).
 
-## 11. Estrutura do repositório
+## 11. Repository structure
 
 ```
 src/anomaly_service/
-├── model/            modelo MSCVAE, salvamento seguro, adaptador para o MLflow
-├── data/             dados sintéticos, leitura do SMD e de CSV, geração de requisições de exemplo
-├── training/         configuração, métricas, pipeline de treino, promoção e rollback
-├── inference/        detecção, agrupamento em eventos, explicações, troca automática de modelo
-├── api/              aplicação FastAPI e endpoints
-├── worker/           Celery: tarefas de detecção e webhook
-├── schemas.py        formato das requisições e respostas
-├── jobs.py           registro dos trabalhos em fila
-├── observability.py  métricas
-└── config.py         variáveis de ambiente
-configs/              configurações de treino (sintético, SMD, modelo para CSV)
-docker/               Dockerfiles e script de inicialização dos containers
-monitoring/           Prometheus e Grafana
-scripts/e2e.sh        teste de ponta a ponta
-tests/                testes unitários, de integração e da API
-docs/                 documentação detalhada por etapa
+├── model/            MSCVAE model, safe serialization, MLflow adapter
+├── data/             synthetic data, SMD and CSV loading, sample request generation
+├── training/         configuration, metrics, training pipeline, promotion and rollback
+├── inference/        detection, event grouping, explanations, automatic model switching
+├── api/              FastAPI application and endpoints
+├── worker/           Celery: detection and webhook tasks
+├── schemas.py        request and response formats
+├── jobs.py           queued job registry
+├── observability.py  metrics
+└── config.py         environment variables
+configs/              training configurations (synthetic, SMD, CSV template)
+docker/               Dockerfiles and container entrypoint script
+monitoring/           Prometheus and Grafana
+scripts/e2e.sh        end-to-end test
+tests/                unit, integration and API tests
+docs/                 detailed documentation per phase
 ```
 
-## 12. Limitações e próximos passos
+## 12. Limitations and next steps
 
-- **Limiar fixo:** não acompanha mudanças graduais no comportamento do sistema. Um limiar
-  ajustado continuamente exigiria guardar estado entre requisições.
-- **Um modelo por vez na API:** servir vários sistemas exigiria escolher o modelo pela rota
-  (por exemplo, `/v1/models/{nome}/detect`).
-- **Promoção sem tráfego real:** um próximo passo seria testar o candidato com parte do tráfego
-  antes de promovê-lo.
-- **Séries muito grandes na fila:** poderiam ser armazenadas em um serviço de arquivos, enviando
-  à fila apenas a referência.
-- **Análise de mudança nos dados por requisição:** relatórios agregados por período dariam uma
-  visão mais estável.
+- **Fixed threshold:** it does not follow gradual changes in the system's behavior. A continuously
+  adjusted threshold would require keeping state between requests.
+- **One model at a time in the API:** serving several systems would require choosing the model by route
+  (for example, `/v1/models/{name}/detect`).
+- **Promotion without real traffic:** a next step would be to test the candidate with part of the traffic
+  before promoting it.
+- **Very large series in the queue:** they could be stored in a file service, sending
+  only the reference to the queue.
+- **Per-request data drift analysis:** reports aggregated by period would give a
+  more stable view.
 
-## 13. Documentação detalhada
+## 13. Detailed documentation
 
-Cada etapa do projeto tem um guia com explicações e um passo a passo para reproduzir:
+Each phase of the project has a guide with explanations and a step-by-step walkthrough to reproduce it:
 
-| Etapa | Guia |
+| Phase | Guide |
 |---|---|
-| Visão geral e glossário | [docs/00-visao-geral.md](docs/00-visao-geral.md) |
-| 0. Ambiente e ferramentas | [docs/fase-0-fundacao.md](docs/fase-0-fundacao.md) |
-| 1. Modelo pronto para produção | [docs/fase-1-modelo.md](docs/fase-1-modelo.md) |
-| 2. Treino, avaliação e dados próprios | [docs/fase-2-treino-mlflow.md](docs/fase-2-treino-mlflow.md) |
-| 3. Versionamento e promoção | [docs/fase-3-registry.md](docs/fase-3-registry.md) |
-| 4. API | [docs/fase-4-api.md](docs/fase-4-api.md) |
-| 5. Processamento em fila | [docs/fase-5-filas.md](docs/fase-5-filas.md) |
-| 6. Containers | [docs/fase-6-containers.md](docs/fase-6-containers.md) |
-| 7. CI/CD | [docs/fase-7-cicd.md](docs/fase-7-cicd.md) |
-| 8. Monitoramento | [docs/fase-8-observabilidade.md](docs/fase-8-observabilidade.md) |
+| Overview and glossary | [docs/00-overview.md](docs/00-overview.md) |
+| 0. Environment and tools | [docs/phase-0-foundation.md](docs/phase-0-foundation.md) |
+| 1. Production-ready model | [docs/phase-1-model.md](docs/phase-1-model.md) |
+| 2. Training, evaluation and your own data | [docs/phase-2-training-mlflow.md](docs/phase-2-training-mlflow.md) |
+| 3. Versioning and promotion | [docs/phase-3-registry.md](docs/phase-3-registry.md) |
+| 4. API | [docs/phase-4-api.md](docs/phase-4-api.md) |
+| 5. Queue processing | [docs/phase-5-queues.md](docs/phase-5-queues.md) |
+| 6. Containers | [docs/phase-6-containers.md](docs/phase-6-containers.md) |
+| 7. CI/CD | [docs/phase-7-cicd.md](docs/phase-7-cicd.md) |
+| 8. Monitoring | [docs/phase-8-observability.md](docs/phase-8-observability.md) |
